@@ -28,12 +28,13 @@ def _session_path(session_id):
     """Return the file path for a session id."""
     return os.path.join(SESSIONS_DIR, f"{session_id}.json")
 
-# Per-user agent settings (workspace, policy, timeout). Stored next to the app in
+# Per-user agent settings (workspace, policy, timeouts). Stored next to the app in
 # config.json and gitignored, because workspace paths are operator-specific.
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
-DEFAULT_AGENT_TIMEOUT = 120   # seconds per API round-trip / shell command
-MAX_TOOL_ITERATIONS = 12      # cap on tool-call rounds per request
-TOOL_OUTPUT_LIMIT = 12000     # chars of a tool result returned to the model
+DEFAULT_COMMAND_TIMEOUT = 120   # seconds for a shell tool (run_command)
+DEFAULT_API_TIMEOUT = 600       # seconds of silence before a streaming request is dropped
+MAX_TOOL_ITERATIONS = 12        # cap on tool-call rounds per request
+TOOL_OUTPUT_LIMIT = 12000       # chars of a tool result returned to the model
 
 POLICY_LABELS = {
     "off": "Off (plain chat)",
@@ -159,9 +160,13 @@ class oChatGUI:
 
         # Agent (tool-calling) settings — operator-configurable, persisted in config.json
         self.agent_config = _load_config()
+        # Migrate pre-split configs: the old "timeout" becomes the command timeout
+        if "timeout" in self.agent_config and "command_timeout" not in self.agent_config:
+            self.agent_config["command_timeout"] = self.agent_config.pop("timeout")
         self.agent_config.setdefault("workspace", "")
         self.agent_config.setdefault("policy", "off")
-        self.agent_config.setdefault("timeout", DEFAULT_AGENT_TIMEOUT)
+        self.agent_config.setdefault("command_timeout", DEFAULT_COMMAND_TIMEOUT)
+        self.agent_config.setdefault("api_timeout", DEFAULT_API_TIMEOUT)
 
         # Menu bar: File (export) and Session (history / system prompt)
         menubar = Menu(root)
@@ -598,10 +603,10 @@ class oChatGUI:
     # Agent tools (tool-calling for coding agents)
     # ------------------------------------------------------------------ #
     def agent_settings(self):
-        """Dialog: workspace directory, policy level, and tool timeout."""
+        """Dialog: workspace directory, policy level, and timeouts."""
         dialog = Toplevel(self.root)
         dialog.title("Agent Settings")
-        dialog.geometry("520x230")
+        dialog.geometry("520x270")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -609,7 +614,10 @@ class oChatGUI:
         workspace_var = StringVar(value=self.agent_config.get("workspace", ""))
         policy_var = StringVar(value=POLICY_LABELS.get(
             self.agent_config.get("policy", "off"), POLICY_LABELS["off"]))
-        timeout_var = StringVar(value=str(self.agent_config.get("timeout", DEFAULT_AGENT_TIMEOUT)))
+        command_timeout_var = StringVar(
+            value=str(self.agent_config.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)))
+        api_timeout_var = StringVar(
+            value=str(self.agent_config.get("api_timeout", DEFAULT_API_TIMEOUT)))
 
         row1 = Frame(dialog)
         row1.pack(fill=X, padx=10, pady=(8, 4))
@@ -628,8 +636,16 @@ class oChatGUI:
 
         row3 = Frame(dialog)
         row3.pack(fill=X, padx=10, pady=4)
-        ttk.Label(row3, text="Tool timeout (seconds):", font=("Arial", 9)).pack(side=LEFT, padx=(0, 10))
-        Entry(row3, textvariable=timeout_var, width=8).pack(side=LEFT)
+        ttk.Label(row3, text="Command timeout (s):", font=("Arial", 9)).pack(side=LEFT, padx=(0, 10))
+        Entry(row3, textvariable=command_timeout_var, width=8).pack(side=LEFT)
+        ttk.Label(row3, text="for shell tools", font=("Arial", 8), foreground="#666666").pack(side=LEFT, padx=(4, 0))
+
+        row4 = Frame(dialog)
+        row4.pack(fill=X, padx=10, pady=4)
+        ttk.Label(row4, text="API timeout (s):", font=("Arial", 9)).pack(side=LEFT, padx=(0, 10))
+        Entry(row4, textvariable=api_timeout_var, width=8).pack(side=LEFT)
+        ttk.Label(row4, text="of silence — streaming keeps the request alive",
+                  font=("Arial", 8), foreground="#666666").pack(side=LEFT, padx=(4, 0))
 
         ttk.Label(dialog, foreground="#cc0000", justify=LEFT, wraplength=480,
                   font=("Arial", 8),
@@ -642,11 +658,13 @@ class oChatGUI:
             ws = workspace_var.get().strip()
             pol = POLICY_KEYS.get(policy_var.get(), "off")
             try:
-                to = int(timeout_var.get().strip() or DEFAULT_AGENT_TIMEOUT)
+                cmd_to = int(command_timeout_var.get().strip() or DEFAULT_COMMAND_TIMEOUT)
+                api_to = int(api_timeout_var.get().strip() or DEFAULT_API_TIMEOUT)
             except ValueError:
-                messagebox.showerror("Invalid timeout", "Tool timeout must be a whole number of seconds.")
+                messagebox.showerror("Invalid timeout", "Timeouts must be whole numbers of seconds.")
                 return
-            to = max(5, min(to, 3600))
+            cmd_to = max(5, min(cmd_to, 3600))
+            api_to = max(5, min(api_to, 3600))
             if pol != "off":
                 if not os.path.isdir(ws):
                     messagebox.showerror("Invalid workspace",
@@ -654,7 +672,8 @@ class oChatGUI:
                                          "Create it first or pick an existing folder.")
                     return
                 ws = os.path.realpath(ws)
-            self.agent_config.update({"workspace": ws, "policy": pol, "timeout": to})
+            self.agent_config.update({"workspace": ws, "policy": pol,
+                                      "command_timeout": cmd_to, "api_timeout": api_to})
             if not _save_config(self.agent_config):
                 messagebox.showwarning("Warning",
                                        "Could not write config.json — settings will not survive a restart.")
@@ -680,6 +699,13 @@ class oChatGUI:
             return
         ws = self.agent_config.get("workspace", "") or "(no workspace set)"
         self.update_status(f"🔧 Agent: {POLICY_LABELS.get(pol, pol)} — {ws}")
+
+    def _stream_tail(self):
+        """Terminate a live-streamed assistant reply with a blank line (main thread)."""
+        self.chat_text.configure(state='normal')
+        self.chat_text.insert(END, "\n\n")
+        self.chat_text.see(END)
+        self.chat_text.configure(state='disabled')
 
     def _execute_tool(self, name, args):
         """Execute one tool call inside the workspace. Returns a text result."""
@@ -767,12 +793,12 @@ class oChatGUI:
             cmd = args.get("command", "")
             if not cmd:
                 return "Error: run_command requires a 'command' argument."
-            timeout = int(self.agent_config.get("timeout", DEFAULT_AGENT_TIMEOUT))
+            command_timeout = int(self.agent_config.get("command_timeout", DEFAULT_COMMAND_TIMEOUT))
             try:
                 result = subprocess.run(cmd, shell=True, cwd=workspace,
-                                        capture_output=True, text=True, timeout=timeout)
+                                        capture_output=True, text=True, timeout=command_timeout)
             except subprocess.TimeoutExpired:
-                return f"Error: command timed out after {timeout}s and was killed."
+                return f"Error: command timed out after {command_timeout}s and was killed."
             except OSError as e:
                 return f"Error running command: {e}"
             out = (result.stdout or "").strip()
@@ -1022,7 +1048,7 @@ class oChatGUI:
         payload = {
             "model": model,
             "messages": messages,
-            "stream": False,
+            "stream": True,
             "options": {
                 "temperature": 0.7,
                 "top_p": 0.9
@@ -1048,27 +1074,96 @@ class oChatGUI:
         self._schedule(self._reset_attachment)
         
         try:
-            timeout = int(self.agent_config.get("timeout", DEFAULT_AGENT_TIMEOUT))
+            api_timeout = int(self.agent_config.get("api_timeout", DEFAULT_API_TIMEOUT))
             tool_round = 0
 
             while True:
                 self._schedule(lambda: self.update_status(f"⏳ Sending to {model}..."))
-                r = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=timeout)
+                # Streaming: tokens arrive progressively, so the API timeout only
+                # bounds *silence* between tokens — long generations stay alive.
+                chunk_parts = []
+                seen_any = [False]
+                retried = [False]
+
+                def stream_chunk(text):
+                    """Buffer a token and show it live in the chat (main thread via _schedule)."""
+                    if not text:
+                        return
+                    # Capture 'first' at schedule time: by the time the callback runs,
+                    # chunk_parts has grown, so we must not inspect it then.
+                    first = not chunk_parts
+                    chunk_parts.append(text)
+                    seen_any[0] = True
+
+                    def _show(first=first, text=text):
+                        self.chat_text.configure(state='normal')
+                        if first:  # first visible chunk -> header line
+                            self.chat_text.insert(END, "🤖 oChat: ")
+                        self.chat_text.insert(END, text)
+                        self.chat_text.see(END)
+                        self.chat_text.configure(state='disabled')
+
+                    self._schedule(_show)
+
+                try:
+                    r = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload,
+                                      stream=True, timeout=(10, api_timeout))
+                except requests.exceptions.Timeout:
+                    if not retried[0] and not seen_any[0]:
+                        # The round never started producing output — safe to retry once
+                        retried[0] = True
+                        self._schedule(lambda: self.append_chat("System", "⏳ Retrying…"))
+                        self._schedule(lambda: self.update_status("⏳ Retrying…"))
+                        continue
+                    self._schedule(lambda: self.append_chat(
+                        "Error", f"⏰ Could not reach Ollama within 10 s. "
+                        "Please check that it is running."))
+                    self._schedule(lambda: self.update_status("⏰ Connect timeout"))
+                    return
 
                 if r.status_code != 200:
                     error_text = f"Error {r.status_code}: {r.text[:200]}"
                     self._schedule(lambda: self.append_chat("Error", f"❌ {error_text}"))
                     self._schedule(lambda: self.update_status(f"⚠️ Error {r.status_code}"))
+                    r.close()
                     return
 
-                data = r.json()
-                message = data.get("message", {})
-                assistant_msg = message.get("content", "") or ""
-                tool_calls = message.get("tool_calls") or []
+                # Consume the NDJSON stream: {"message": {"content": "..."}, "done": bool}
+                final_message = {}
+                try:
+                    with r:
+                        for raw in r.iter_lines(decode_unicode=True):
+                            if not raw or not raw.strip():
+                                continue
+                            try:
+                                obj = json.loads(raw)
+                            except json.JSONDecodeError:
+                                continue
+                            piece = (obj.get("message") or {}).get("content", "")
+                            stream_chunk(piece or "")
+                            if obj.get("done"):
+                                final_message = obj.get("message") or {}
+                                break
+                except requests.exceptions.Timeout:
+                    # Mid-stream silence: partial output is already on screen; do not
+                    # re-run the round (would duplicate), just report clearly.
+                    self._schedule(lambda t=api_timeout: self.append_chat(
+                        "Error", f"⏰ No data received for {t}s mid-response — the "
+                        f"partial answer was not saved. If this repeats, raise the "
+                        f"API timeout in Agent Settings."))
+                    self._schedule(lambda: self.update_status("⏰ Idle timeout"))
+                    if seen_any[0]:
+                        self._schedule(lambda: self._stream_tail())
+                    return
+
+                assistant_msg = "".join(chunk_parts)
+                tool_calls = final_message.get("tool_calls") or []
 
                 # Agent mode: the model asked to use tools — execute and loop
                 if tool_calls and tool_round < MAX_TOOL_ITERATIONS:
                     tool_round += 1
+                    if seen_any[0]:
+                        self._schedule(lambda: self._stream_tail())
                     messages.append({"role": "assistant", "content": assistant_msg,
                                      "tool_calls": tool_calls})
                     for tc in tool_calls:
@@ -1095,23 +1190,33 @@ class oChatGUI:
                 if not assistant_msg:
                     msg = ("❌ Agent stopped without a final text answer."
                            if tool_round else "❌ No response from Ollama")
+                    if seen_any[0]:
+                        self._schedule(lambda: self._stream_tail())
                     self._schedule(lambda m=msg: self.append_chat("Error", m))
                     self._schedule(lambda: self.update_status("⚠️ Empty response"))
                     return
 
                 self.conversation.append({"role": "assistant", "content": assistant_msg})
                 self._schedule(self._save_session)  # persist history
-                self._schedule(lambda a=assistant_msg: self.append_chat("oChat", a))
+                if seen_any[0]:
+                    self._schedule(lambda: self._stream_tail())
+                else:
+                    self._schedule(lambda a=assistant_msg: self.append_chat("oChat", a))
                 self._schedule(lambda: self.update_status("✅ Done"))
                 return
         except requests.exceptions.Timeout:
-            self._schedule(lambda: self.append_chat("Error", "⏰ Request timed out. Please try again."))
+            self._schedule(lambda t=api_timeout: self.append_chat(
+                "Error", f"⏰ Request timed out after {t}s of silence. "
+                f"Raise the API timeout (Session → Agent Settings) and try again."))
             self._schedule(lambda: self.update_status("⏰ Timeout"))
         except requests.exceptions.ConnectionError:
             self._schedule(lambda: self.append_chat("Error", "🔌 Cannot connect to Ollama. Please check if it's running."))
             self._schedule(lambda: self.update_status("🔌 Connection error"))
         except Exception as e:
-            self._schedule(lambda: self.append_chat("Error", f"❌ Error: {str(e)}"))
+            # Capture e now — Python unbinds the except target when the block ends,
+            # and lazy lambdas would otherwise raise NameError in the main loop.
+            err_msg = str(e)
+            self._schedule(lambda m=err_msg: self.append_chat("Error", f"❌ Error: {m}"))
             self._schedule(lambda: self.update_status("⚠️ Error"))
         finally:
             # Re-enable input after response

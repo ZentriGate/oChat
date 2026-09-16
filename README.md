@@ -70,7 +70,10 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
 - Open **Session → Agent Settings…** and pick:
   - **Workspace directory** — the folder the model may read/write (browse or type).
   - **Policy** — `Off` (plain chat), `Read-only`, `Read + Write`, or `Read + Write + Shell`.
-  - **Tool timeout** — seconds per API round-trip / shell command.
+  - **Command timeout** — seconds for shell tools (default 120).
+  - **API timeout** — seconds of *silence* before a request is aborted (default 600).
+- Responses are **streamed** token by token, so long generations keep the
+  connection alive; the API timeout only triggers if the model goes silent.
 - Settings are stored in `config.json`, which is **not** tracked by git.
 - The model sees only the tools its policy allows, and every path is resolved
   against the workspace root — attempts to escape (`../`, symlinks, absolute
