@@ -63,6 +63,23 @@ The **model dropdown** lists all locally installed models (use **↻ Refresh** t
 - **`Error 5xx`** → the selected model is missing or the request is malformed; check locally installed models with `ollama list`.
 - **Image not understood** → use a vision model such as LLaVA (`ollama pull llava`).
 
+## Agent mode (tool calling)
+
+For coding agents, oChat supports Ollama function calling inside a **workspace folder you choose**:
+
+- Open **Session → Agent Settings…** and pick:
+  - **Workspace directory** — the folder the model may read/write (browse or type).
+  - **Policy** — `Off` (plain chat), `Read-only`, `Read + Write`, or `Read + Write + Shell`.
+  - **Tool timeout** — seconds per API round-trip / shell command.
+- Settings are stored in `config.json`, which is **not** tracked by git.
+- The model sees only the tools its policy allows, and every path is resolved
+  against the workspace root — attempts to escape (`../`, symlinks, absolute
+  paths) are refused.
+- Tool activity is logged in the chat so you can always see what the agent did.
+
+> ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
+> commands in the workspace. Only enable it in a directory you trust.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

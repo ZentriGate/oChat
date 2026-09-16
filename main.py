@@ -4,10 +4,11 @@ import requests
 import base64
 import os
 import json
+import subprocess
 from datetime import datetime
-from tkinter import (Tk, Text, Button, END, LEFT, RIGHT, BOTH, X, Frame, ttk,
-                     Scrollbar, VERTICAL, Y, StringVar, filedialog, messagebox,
-                     Menu, Toplevel)
+from tkinter import (Tk, Text, Button, Entry, END, LEFT, RIGHT, BOTH, X, Frame,
+                     ttk, Scrollbar, VERTICAL, Y, StringVar, filedialog,
+                     messagebox, Menu, Toplevel)
 from PIL import Image, ImageTk
 
 OLLAMA_HOST = "http://localhost:11434"
@@ -27,6 +28,120 @@ def _session_path(session_id):
     """Return the file path for a session id."""
     return os.path.join(SESSIONS_DIR, f"{session_id}.json")
 
+# Per-user agent settings (workspace, policy, timeout). Stored next to the app in
+# config.json and gitignored, because workspace paths are operator-specific.
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+DEFAULT_AGENT_TIMEOUT = 120   # seconds per API round-trip / shell command
+MAX_TOOL_ITERATIONS = 12      # cap on tool-call rounds per request
+TOOL_OUTPUT_LIMIT = 12000     # chars of a tool result returned to the model
+
+POLICY_LABELS = {
+    "off": "Off (plain chat)",
+    "read": "Read-only",
+    "write": "Read + Write",
+    "shell": "Read + Write + Shell",
+}
+POLICY_KEYS = {label: key for key, label in POLICY_LABELS.items()}
+
+
+def _load_config():
+    """Load operator settings from config.json ({} if missing or corrupt)."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _save_config(config):
+    """Persist operator settings to config.json. Returns True on success."""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def _tool(name, description, properties, required):
+    """Build one OpenAI-style tool/function schema for the Ollama API."""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object",
+                           "properties": properties,
+                           "required": required},
+        },
+    }
+
+
+def _tools_for_policy(policy):
+    """Declare the tool set the model may call for the configured policy."""
+    list_dir = _tool(
+        "list_dir",
+        "List the entries of a directory inside the workspace (relative paths "
+        "start at the workspace root). One line per entry with type and size.",
+        {"path": {"type": "string",
+                  "description": "Directory path relative to the workspace (default '.')"}},
+        [])
+    read_file = _tool(
+        "read_file",
+        "Read a text file inside the workspace and return its full content.",
+        {"path": {"type": "string", "description": "File path relative to the workspace"}},
+        ["path"])
+    write_file = _tool(
+        "write_file",
+        "Create or overwrite a file inside the workspace, creating missing "
+        "parent directories automatically.",
+        {"path": {"type": "string", "description": "File path relative to the workspace"},
+         "content": {"type": "string", "description": "Full file content to write"}},
+        ["path", "content"])
+    edit_file = _tool(
+        "edit_file",
+        "Replace the first exact occurrence of old_string with new_string in a "
+        "file inside the workspace. Use this instead of rewriting whole files.",
+        {"path": {"type": "string", "description": "File path relative to the workspace"},
+         "old_string": {"type": "string", "description": "Exact text to find (must appear at least once)"},
+         "new_string": {"type": "string", "description": "Replacement text"}},
+        ["path", "old_string", "new_string"])
+    run_command = _tool(
+        "run_command",
+        "Run a shell command inside the workspace directory and return its "
+        "output and exit code. Non-interactive; killed on timeout. Use for "
+        "builds, tests, and quick checks.",
+        {"command": {"type": "string", "description": "Shell command to run in the workspace"}},
+        ["command"])
+
+    base = [list_dir, read_file]
+    if policy == "read":
+        return base
+    if policy == "write":
+        return base + [write_file, edit_file]
+    if policy == "shell":
+        return base + [write_file, edit_file, run_command]
+    return []  # "off"
+
+
+def _resolve_in_workspace(workspace, path_arg):
+    """Resolve a model-supplied path safely inside the workspace root.
+
+    Returns the absolute real path, or raises ValueError with an explanation
+    that is safe to send back to the model.
+    """
+    root = os.path.realpath(workspace)
+    candidate = os.path.realpath(os.path.join(root, path_arg or "."))
+    if candidate != root and not candidate.startswith(root + os.sep):
+        raise ValueError(
+            f"Path '{path_arg}' resolves outside the workspace '{root}' and was refused."
+        )
+    return candidate
+
+
 class oChatGUI:
     def __init__(self, root):
         self.root = root
@@ -42,6 +157,12 @@ class oChatGUI:
         self.session_created_at = ""
         self.system_prompt = DEFAULT_SYSTEM_PROMPT
 
+        # Agent (tool-calling) settings — operator-configurable, persisted in config.json
+        self.agent_config = _load_config()
+        self.agent_config.setdefault("workspace", "")
+        self.agent_config.setdefault("policy", "off")
+        self.agent_config.setdefault("timeout", DEFAULT_AGENT_TIMEOUT)
+
         # Menu bar: File (export) and Session (history / system prompt)
         menubar = Menu(root)
         file_menu = Menu(menubar, tearoff=0)
@@ -55,6 +176,7 @@ class oChatGUI:
         session_menu = Menu(menubar, tearoff=0)
         session_menu.add_command(label="New Session", command=self.new_session)
         session_menu.add_command(label="Set System Prompt…", command=self.set_system_prompt)
+        session_menu.add_command(label="Agent Settings…", command=self.agent_settings)
         session_menu.add_separator()
         session_menu.add_command(label="Delete Current Session…", command=self.delete_session)
         menubar.add_cascade(label="Session", menu=session_menu)
@@ -473,6 +595,213 @@ class oChatGUI:
         self.root.destroy()
 
     # ------------------------------------------------------------------ #
+    # Agent tools (tool-calling for coding agents)
+    # ------------------------------------------------------------------ #
+    def agent_settings(self):
+        """Dialog: workspace directory, policy level, and tool timeout."""
+        dialog = Toplevel(self.root)
+        dialog.title("Agent Settings")
+        dialog.geometry("520x230")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        workspace_var = StringVar(value=self.agent_config.get("workspace", ""))
+        policy_var = StringVar(value=POLICY_LABELS.get(
+            self.agent_config.get("policy", "off"), POLICY_LABELS["off"]))
+        timeout_var = StringVar(value=str(self.agent_config.get("timeout", DEFAULT_AGENT_TIMEOUT)))
+
+        row1 = Frame(dialog)
+        row1.pack(fill=X, padx=10, pady=(8, 4))
+        ttk.Label(row1, text="Workspace directory:", font=("Arial", 9)).pack(side=LEFT)
+        Entry(row1, textvariable=workspace_var).pack(side=LEFT, fill=X, expand=True)
+        Button(row1, text="Browse…",
+               command=lambda: workspace_var.set(
+                   filedialog.askdirectory(title="Choose the agent workspace") or workspace_var.get())
+               ).pack(side=LEFT)
+
+        row2 = Frame(dialog)
+        row2.pack(fill=X, padx=10, pady=4)
+        ttk.Label(row2, text="Policy:", font=("Arial", 9)).pack(side=LEFT, padx=(0, 10))
+        ttk.Combobox(row2, textvariable=policy_var, state="readonly", width=22,
+                     values=list(POLICY_LABELS.values())).pack(side=LEFT)
+
+        row3 = Frame(dialog)
+        row3.pack(fill=X, padx=10, pady=4)
+        ttk.Label(row3, text="Tool timeout (seconds):", font=("Arial", 9)).pack(side=LEFT, padx=(0, 10))
+        Entry(row3, textvariable=timeout_var, width=8).pack(side=LEFT)
+
+        ttk.Label(dialog, foreground="#cc0000", justify=LEFT, wraplength=480,
+                  font=("Arial", 8),
+                  text="The model may only touch files inside the workspace. "
+                       "'Read + Write + Shell' additionally allows running shell "
+                       "commands — only enable it in a directory you trust.").pack(
+            anchor='w', padx=10, pady=(4, 2))
+
+        def save():
+            ws = workspace_var.get().strip()
+            pol = POLICY_KEYS.get(policy_var.get(), "off")
+            try:
+                to = int(timeout_var.get().strip() or DEFAULT_AGENT_TIMEOUT)
+            except ValueError:
+                messagebox.showerror("Invalid timeout", "Tool timeout must be a whole number of seconds.")
+                return
+            to = max(5, min(to, 3600))
+            if pol != "off":
+                if not os.path.isdir(ws):
+                    messagebox.showerror("Invalid workspace",
+                                         "The workspace directory does not exist.\n"
+                                         "Create it first or pick an existing folder.")
+                    return
+                ws = os.path.realpath(ws)
+            self.agent_config.update({"workspace": ws, "policy": pol, "timeout": to})
+            if not _save_config(self.agent_config):
+                messagebox.showwarning("Warning",
+                                       "Could not write config.json — settings will not survive a restart.")
+            self._update_agent_status()
+            dialog.destroy()
+
+        def cancel():
+            dialog.destroy()
+
+        button_frame = Frame(dialog)
+        button_frame.pack(fill=X, padx=10, pady=(0, 8))
+        Button(button_frame, text="Save", command=save, width=10).pack(side=RIGHT, padx=5)
+        Button(button_frame, text="Cancel", command=cancel, width=10).pack(side=LEFT, padx=5)
+
+        dialog.bind("<Return>", lambda e: save())
+        dialog.bind("<Escape>", lambda e: cancel())
+
+    def _update_agent_status(self):
+        """Show the active agent workspace/policy in the status bar."""
+        pol = self.agent_config.get("policy", "off")
+        if pol == "off":
+            self.update_status("🔧 Agent: off")
+            return
+        ws = self.agent_config.get("workspace", "") or "(no workspace set)"
+        self.update_status(f"🔧 Agent: {POLICY_LABELS.get(pol, pol)} — {ws}")
+
+    def _execute_tool(self, name, args):
+        """Execute one tool call inside the workspace. Returns a text result."""
+        workspace = self.agent_config.get("workspace", "")
+        if not workspace or not os.path.isdir(workspace):
+            return ("Error: no valid agent workspace is configured. "
+                    "Tell the user to set one (Session menu → Agent Settings…).")
+
+        if name == "list_dir":
+            try:
+                path = _resolve_in_workspace(workspace, args.get("path", "."))
+            except ValueError as e:
+                return str(e)
+            try:
+                entries = sorted(os.listdir(path))
+            except OSError as e:
+                return f"Error listing {path}: {e}"
+            if not entries:
+                return "(empty directory)"
+            lines = []
+            for entry in entries:
+                full = os.path.join(path, entry)
+                try:
+                    if os.path.isdir(full):
+                        lines.append(f"dir  {entry}/")
+                    else:
+                        lines.append(f"file {entry} ({os.path.getsize(full)} B)")
+                except OSError:
+                    lines.append(f"??   {entry}")
+            return "\n".join(lines)
+
+        if name == "read_file":
+            try:
+                pth = _resolve_in_workspace(workspace, args.get("path", ""))
+            except ValueError as e:
+                return str(e)
+            try:
+                with open(pth, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except OSError as e:
+                return f"Error reading {pth}: {e}"
+            return content if content else "(empty file)"
+
+        if name == "write_file":
+            try:
+                pth = _resolve_in_workspace(workspace, args.get("path", ""))
+            except ValueError as e:
+                return str(e)
+            content = args.get("content", "")
+            if isinstance(content, list):  # some clients send content blocks
+                content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+            try:
+                os.makedirs(os.path.dirname(pth) or workspace, exist_ok=True)
+                with open(pth, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except OSError as e:
+                return f"Error writing {pth}: {e}"
+            return f"Wrote {len(content)} bytes to {pth}"
+
+        if name == "edit_file":
+            try:
+                pth = _resolve_in_workspace(workspace, args.get("path", ""))
+            except ValueError as e:
+                return str(e)
+            old_s = args.get("old_string", "")
+            new_s = args.get("new_string", "")
+            if not old_s:
+                return "Error: edit_file requires a non-empty 'old_string'."
+            try:
+                with open(pth, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except OSError as e:
+                return f"Error reading {pth}: {e}"
+            if old_s not in content:
+                return (f"Error: 'old_string' not found in {pth}. "
+                        "Return the exact text to replace (must appear at least once).")
+            try:
+                with open(pth, "w", encoding="utf-8") as f:
+                    f.write(content.replace(old_s, new_s, 1))
+            except OSError as e:
+                return f"Error writing {pth}: {e}"
+            return f"Edited {pth}: replaced the first occurrence."
+
+        if name == "run_command":
+            cmd = args.get("command", "")
+            if not cmd:
+                return "Error: run_command requires a 'command' argument."
+            timeout = int(self.agent_config.get("timeout", DEFAULT_AGENT_TIMEOUT))
+            try:
+                result = subprocess.run(cmd, shell=True, cwd=workspace,
+                                        capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return f"Error: command timed out after {timeout}s and was killed."
+            except OSError as e:
+                return f"Error running command: {e}"
+            out = (result.stdout or "").strip()
+            err = (result.stderr or "").strip()
+            if err:
+                out = (out + ("\n" if out else "") + f"[stderr]\n{err}").strip()
+            if not out:
+                out = f"Command finished with exit code {result.returncode}."
+            return (f"exit code: {result.returncode}\n{out}")[:TOOL_OUTPUT_LIMIT]
+
+        return f"Error: unknown tool '{name}'."
+
+    @staticmethod
+    def _fmt_tool_args(args):
+        """Short human-readable render of tool arguments for the chat log."""
+
+        def short(v):
+            s = str(v)
+            return s[:80] + ("…" if len(s) > 80 else "")
+
+        parts = []
+        for key in ("path", "command", "old_string"):
+            if key in args:
+                parts.append(f"{key}={short(args[key])}")
+        if not parts:
+            parts = [f"{k}={short(v)}" for k, v in list(args.items())[:4]]
+        return ", ".join(parts)
+
+    # ------------------------------------------------------------------ #
     # System prompt customization
     # ------------------------------------------------------------------ #
     def set_system_prompt(self):
@@ -700,6 +1029,12 @@ class oChatGUI:
             }
         }
         
+        # Enable tool calling (agent mode) when the configured policy declares tools
+        tools = _tools_for_policy(self.agent_config.get("policy", "off"))
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
         # Add images if present (only for the latest user message)
         if self.current_image_base64 and messages:
             # Find the last user message and add images
@@ -713,25 +1048,62 @@ class oChatGUI:
         self._schedule(self._reset_attachment)
         
         try:
-            self._schedule(lambda: self.update_status(f"⏳ Sending to {model}..."))
-            r = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=120)
-            
-            if r.status_code == 200:
+            timeout = int(self.agent_config.get("timeout", DEFAULT_AGENT_TIMEOUT))
+            tool_round = 0
+
+            while True:
+                self._schedule(lambda: self.update_status(f"⏳ Sending to {model}..."))
+                r = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload, timeout=timeout)
+
+                if r.status_code != 200:
+                    error_text = f"Error {r.status_code}: {r.text[:200]}"
+                    self._schedule(lambda: self.append_chat("Error", f"❌ {error_text}"))
+                    self._schedule(lambda: self.update_status(f"⚠️ Error {r.status_code}"))
+                    return
+
                 data = r.json()
-                assistant_msg = data.get("message", {}).get("content", "")
-                if assistant_msg:
-                    self.conversation.append({"role": "assistant", "content": assistant_msg})
-                    self._schedule(self._save_session)  # persist history
-                    self._schedule(lambda: self.append_chat("oChat", assistant_msg))
-                    self._schedule(lambda: self.update_status("✅ Done"))
-                else:
-                    self._schedule(lambda: self.append_chat("Error", "❌ No response from Ollama"))
+                message = data.get("message", {})
+                assistant_msg = message.get("content", "") or ""
+                tool_calls = message.get("tool_calls") or []
+
+                # Agent mode: the model asked to use tools — execute and loop
+                if tool_calls and tool_round < MAX_TOOL_ITERATIONS:
+                    tool_round += 1
+                    messages.append({"role": "assistant", "content": assistant_msg,
+                                     "tool_calls": tool_calls})
+                    for tc in tool_calls:
+                        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                        name = fn.get("name", "")
+                        raw = fn.get("arguments", {})
+                        if isinstance(raw, str):
+                            try:
+                                args = json.loads(raw) if raw.strip() else {}
+                            except json.JSONDecodeError:
+                                args = {"_raw": raw}
+                        elif isinstance(raw, dict):
+                            args = raw
+                        else:
+                            args = {}
+                        self._schedule(lambda n=name, a=args: self.append_chat(
+                            "Tool", f"🔧 {n}({self._fmt_tool_args(a)})"))
+                        result = self._execute_tool(name, args)
+                        self._schedule(lambda r_=result: self.append_chat(
+                            "Tool result", f"{r_[:1200]}"))
+                        messages.append({"role": "tool", "content": result})
+                    continue
+
+                if not assistant_msg:
+                    msg = ("❌ Agent stopped without a final text answer."
+                           if tool_round else "❌ No response from Ollama")
+                    self._schedule(lambda m=msg: self.append_chat("Error", m))
                     self._schedule(lambda: self.update_status("⚠️ Empty response"))
-            else:
-                error_text = f"Error {r.status_code}: {r.text[:200]}"
-                self._schedule(lambda: self.append_chat("Error", f"❌ {error_text}"))
-                self._schedule(lambda: self.update_status(f"⚠️ Error {r.status_code}"))
-                
+                    return
+
+                self.conversation.append({"role": "assistant", "content": assistant_msg})
+                self._schedule(self._save_session)  # persist history
+                self._schedule(lambda a=assistant_msg: self.append_chat("oChat", a))
+                self._schedule(lambda: self.update_status("✅ Done"))
+                return
         except requests.exceptions.Timeout:
             self._schedule(lambda: self.append_chat("Error", "⏰ Request timed out. Please try again."))
             self._schedule(lambda: self.update_status("⏰ Timeout"))
@@ -759,6 +1131,7 @@ if __name__ == "__main__":
     gui.append_chat("System", "💾 Chat history autosaves into the 'sessions' folder")
     gui.append_chat("System", "⚙ Session menu: new/open/delete chats + system prompt")
     gui.append_chat("System", "📤 Export history: File → Export as…")
+    gui.append_chat("System", "🔧 Agent mode: Session → Agent Settings… (workspace + policy)")
     gui.update_status("Ready")
     
     root.mainloop()

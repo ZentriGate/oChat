@@ -18,3 +18,4 @@ env/
 
 # App data (chat history)
 sessions/
+config.json
