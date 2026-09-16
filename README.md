@@ -44,6 +44,9 @@ The **model dropdown** lists all locally installed models (use **↻ Refresh** t
 
 - Lists all local Ollama models (refreshable).
 - In-session chat history.
+- Session history — every chat autosaves to `sessions/` and can be reopened from the **Session** dropdown.
+- Custom **system prompts** per session (Session → Set System Prompt…).
+- **Export** the current conversation to Markdown, JSON, or plain text (File → Export as…).
 - Image attachment for vision models (LLaVA and similar).
 - Simple, responsive UI built with Tkinter (part of the Python standard library).
 - Threaded network requests keep the UI responsive while waiting for the model.
@@ -52,6 +55,7 @@ The **model dropdown** lists all locally installed models (use **↻ Refresh** t
 
 - **`OLLAMA_HOST`** in `main.py` — base URL of your Ollama server (default: `http://localhost:11434`).
 - **`DEFAULT_MODEL`** in `main.py` — model preselected in the dropdown (default: `llama2`).
+- **`sessions/`** — folder created next to `main.py`; each conversation is autosaved there as JSON and picks up the title from its first message.
 
 ## Troubleshooting
 

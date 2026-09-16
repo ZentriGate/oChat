@@ -3,11 +3,29 @@ import threading
 import requests
 import base64
 import os
-from tkinter import Tk, Text, Button, END, LEFT, RIGHT, BOTH, X, Frame, ttk, Scrollbar, VERTICAL, Y, StringVar, filedialog, messagebox
+import json
+from datetime import datetime
+from tkinter import (Tk, Text, Button, END, LEFT, RIGHT, BOTH, X, Frame, ttk,
+                     Scrollbar, VERTICAL, Y, StringVar, filedialog, messagebox,
+                     Menu, Toplevel)
 from PIL import Image, ImageTk
 
 OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "llama2"  # or any Ollama model installed locally
+DEFAULT_SYSTEM_PROMPT = ""  # empty = no system prompt; set one via the Session menu
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SESSIONS_DIR = os.path.join(APP_DIR, "sessions")  # chat history is saved here
+
+
+def _now_iso():
+    """Current local time as a sortable, human-readable string."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _session_path(session_id):
+    """Return the file path for a session id."""
+    return os.path.join(SESSIONS_DIR, f"{session_id}.json")
 
 class oChatGUI:
     def __init__(self, root):
@@ -15,6 +33,32 @@ class oChatGUI:
         root.title("oChat - Image Support")
         root.geometry("900x750")  # Slightly larger
         root.minsize(500, 500)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Session / history state
+        self._session_meta = []
+        self.session_id = None
+        self.session_title = "New Chat"
+        self.session_created_at = ""
+        self.system_prompt = DEFAULT_SYSTEM_PROMPT
+
+        # Menu bar: File (export) and Session (history / system prompt)
+        menubar = Menu(root)
+        file_menu = Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Export as Markdown…", command=lambda: self.export_chat("markdown"))
+        file_menu.add_command(label="Export as JSON…", command=lambda: self.export_chat("json"))
+        file_menu.add_command(label="Export as Text…", command=lambda: self.export_chat("text"))
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.destroy)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        session_menu = Menu(menubar, tearoff=0)
+        session_menu.add_command(label="New Session", command=self.new_session)
+        session_menu.add_command(label="Set System Prompt…", command=self.set_system_prompt)
+        session_menu.add_separator()
+        session_menu.add_command(label="Delete Current Session…", command=self.delete_session)
+        menubar.add_cascade(label="Session", menu=session_menu)
+        root.config(menu=menubar)
 
         # Configure ttk style for better visibility
         style = ttk.Style()
@@ -41,6 +85,25 @@ class oChatGUI:
         # Refresh models button
         refresh_button = Button(model_frame, text="↻ Refresh", command=self.refresh_models)
         refresh_button.pack(side=RIGHT)
+
+        # Session management row
+        session_frame = Frame(top_frame)
+        session_frame.pack(fill=X, pady=2)
+
+        ttk.Label(session_frame, text="Session:", font=("Arial", 9)).pack(side=LEFT, padx=(0, 5))
+        self.session_title_var = StringVar(value="New Chat")
+        self.session_combo = ttk.Combobox(session_frame, textvariable=self.session_title_var,
+                                          state="readonly", width=28)
+        self.session_combo.pack(side=LEFT, fill=X, expand=True, padx=(0, 5))
+        self.session_combo.bind("<<ComboboxSelected>>", self._on_session_selected)
+
+        new_session_button = Button(session_frame, text="New", command=self.new_session, width=6)
+        new_session_button.pack(side=LEFT, padx=(0, 5))
+
+        delete_session_button = Button(session_frame, text="Delete", command=self.delete_session, width=8)
+        delete_session_button.pack(side=LEFT)
+
+        self.refresh_session_list()  # populate the dropdown from the sessions/ folder
 
         # Image attachment frame - made more compact
         image_frame = Frame(top_frame)
@@ -270,6 +333,269 @@ class oChatGUI:
         except Exception:
             pass  # Window was closed while the background request was in flight
 
+    # ------------------------------------------------------------------ #
+    # Session / history management
+    # ------------------------------------------------------------------ #
+    def _new_session_id(self):
+        """Return a timestamp-based id for a new session file."""
+        return datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+
+    def _ensure_sessions_dir(self):
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+    def list_sessions(self):
+        """Return session metadata (id/title/updated_at), newest first."""
+        self._ensure_sessions_dir()
+        sessions = []
+        for fname in os.listdir(SESSIONS_DIR):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(SESSIONS_DIR, fname), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            sessions.append({
+                "id": data.get("id", fname[:-5]),
+                "title": data.get("title", "Untitled session"),
+                "updated_at": data.get("updated_at", ""),
+            })
+        sessions.sort(key=lambda s: s["updated_at"], reverse=True)
+        return sessions
+
+    def refresh_session_list(self):
+        """Refresh the session dropdown from disk (main thread only)."""
+        self._session_meta = self.list_sessions()
+        self.session_combo['values'] = [s["title"] for s in self._session_meta]
+
+    def _save_session(self):
+        """Persist the current conversation to disk (main thread only)."""
+        if not self.conversation:
+            return
+        self._ensure_sessions_dir()
+        if not self.session_id:
+            self.session_id = self._new_session_id()
+        if not self.session_created_at:
+            self.session_created_at = _now_iso()
+        data = {
+            "id": self.session_id,
+            "title": self.session_title,
+            "created_at": self.session_created_at,
+            "updated_at": _now_iso(),
+            "system_prompt": self.system_prompt,
+            "messages": self.conversation,
+        }
+        try:
+            with open(_session_path(self.session_id), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            self.update_status(f"⚠️ Could not save session: {e}")
+            print("Error saving session:", e)
+            return
+        self.refresh_session_list()
+
+    def load_session(self, session_id):
+        """Load a saved session, replacing the current conversation."""
+        try:
+            with open(_session_path(session_id), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            messagebox.showerror("Error", f"Could not load session:\n{e}")
+            return
+
+        self._save_session()  # persist whatever was in the chat area first
+        self.session_id = data.get("id", session_id)
+        self.session_title = data.get("title", "Untitled session")
+        self.session_created_at = data.get("created_at", "")
+        self.system_prompt = data.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+        self.conversation = data.get("messages", [])
+
+        # Rebuild the on-screen transcript
+        self.chat_text.configure(state='normal')
+        self.chat_text.delete('1.0', END)
+        for msg in self.conversation:
+            sender = {"user": "You", "assistant": "oChat"}.get(
+                msg.get("role"), msg.get("role") or "?")
+            self.append_chat(sender, msg.get("content", ""))
+        self.chat_text.configure(state='disabled')
+
+        self.session_title_var.set(self.session_title)
+        self.refresh_session_list()
+        self._update_sysprompt_status()
+        self.update_status(f"📂 Session loaded: {self.session_title}")
+
+    def new_session(self, save_current=True):
+        """Start a fresh conversation (optionally autosaving the active one)."""
+        if save_current:
+            self._save_session()
+        self.session_id = None
+        self.session_title = "New Chat"
+        self.session_created_at = ""
+        self.conversation = []
+        self.chat_text.configure(state='normal')
+        self.chat_text.delete('1.0', END)
+        self.chat_text.configure(state='disabled')
+        self._reset_attachment()
+        self.session_title_var.set("New Chat")
+        self.refresh_session_list()
+        self._update_sysprompt_status()
+        self.update_status("✨ New session started")
+        self.input_text.focus_set()
+
+    def delete_session(self):
+        """Delete the current session's file and start fresh."""
+        if not self.session_id:
+            self.update_status("ℹ No saved session to delete")
+            return
+        if not messagebox.askyesno("Delete session",
+                                   f"Delete the saved session '{self.session_title}'?\n"
+                                   "This cannot be undone."):
+            return
+        try:
+            os.remove(_session_path(self.session_id))
+        except OSError as e:
+            messagebox.showerror("Error", f"Could not delete session file:\n{e}")
+            return
+        self.new_session(save_current=False)
+        self.update_status("🗑️ Session deleted")
+
+    def _on_session_selected(self, event=None):
+        """Dropdown selection -> load the chosen saved session."""
+        title = self.session_title_var.get()
+        for meta in self._session_meta:  # newest first
+            if meta["title"] == title:
+                self.load_session(meta["id"])
+                return
+
+    def _on_close(self):
+        """Autosave the active session, then close the window."""
+        self._save_session()
+        self.root.destroy()
+
+    # ------------------------------------------------------------------ #
+    # System prompt customization
+    # ------------------------------------------------------------------ #
+    def set_system_prompt(self):
+        """Dialog to edit the system prompt sent with every request."""
+        dialog = Toplevel(self.root)
+        dialog.title("System Prompt")
+        dialog.geometry("520x280")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="System prompt (sent before every message):",
+                  font=("Arial", 9, "bold")).pack(anchor='w', padx=10, pady=(8, 4))
+        prompt_text = Text(dialog, wrap='word', height=8, font=("Arial", 10))
+        prompt_text.pack(fill=BOTH, expand=True, padx=10, pady=(0, 8))
+        prompt_text.insert("1.0", self.system_prompt)
+        prompt_text.focus_set()
+
+        def save():
+            self.system_prompt = prompt_text.get("1.0", "end-1c").strip()
+            self._save_session()
+            self._update_sysprompt_status()
+            dialog.destroy()
+
+        def clear():
+            self.system_prompt = ""
+            self._save_session()
+            self._update_sysprompt_status()
+            dialog.destroy()
+
+        def cancel():
+            dialog.destroy()
+
+        button_frame = Frame(dialog)
+        button_frame.pack(fill=X, padx=10, pady=(0, 8))
+        Button(button_frame, text="Save", command=save, width=10).pack(side=RIGHT, padx=5)
+        Button(button_frame, text="Clear", command=clear, width=10).pack(side=RIGHT)
+        Button(button_frame, text="Cancel", command=cancel, width=10).pack(side=LEFT, padx=5)
+
+        dialog.bind("<Control-Return>", lambda e: save())
+        dialog.bind("<Escape>", lambda e: cancel())
+
+    def _update_sysprompt_status(self):
+        """Show the active system prompt (or none) in the status bar."""
+        preview = self.system_prompt if self.system_prompt else "none"
+        if len(preview) > 60:
+            preview = preview[:60] + "…"
+        self.update_status(f"⚙ System prompt: {preview}")
+
+    # ------------------------------------------------------------------ #
+    # Export
+    # ------------------------------------------------------------------ #
+    def export_chat(self, fmt="markdown"):
+        """Export the current conversation to a file chosen by the user."""
+        if not self.conversation:
+            messagebox.showinfo("Nothing to export", "The current conversation is empty.")
+            return
+
+        if fmt == "json":
+            filetypes = [("JSON files", "*.json"), ("All files", "*.*")]
+            default_ext = ".json"
+            build = self._build_json_export
+        elif fmt == "text":
+            filetypes = [("Text files", "*.txt"), ("All files", "*.*")]
+            default_ext = ".txt"
+            build = self._build_text_export
+        else:
+            filetypes = [("Markdown files", "*.md"), ("All files", "*.*")]
+            default_ext = ".md"
+            build = self._build_markdown_export
+
+        filename = filedialog.asksaveasfilename(
+            title="Export chat",
+            defaultextension=default_ext,
+            filetypes=filetypes,
+            initialfile=f"oChat-{datetime.now().strftime('%Y%m%d-%H%M%S')}{default_ext}",
+        )
+        if not filename:
+            return
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(build())
+        except OSError as e:
+            messagebox.showerror("Error", f"Could not write file:\n{e}")
+            return
+        self.update_status(f"📤 Exported conversation to {os.path.basename(filename)}")
+
+    def _build_markdown_export(self):
+        lines = [f"# {self.session_title}", "",
+                 f"- **Model:** {self.model_var.get()}",
+                 f"- **Exported:** {_now_iso()}"]
+        if self.system_prompt:
+            lines.append(f"- **System prompt:** {self.system_prompt}")
+        lines += ["", "---", ""]
+        for msg in self.conversation:
+            sender = {"user": "🧑 User", "assistant": "🤖 oChat"}.get(
+                msg.get("role"), msg.get("role") or "?")
+            lines += [f"## {sender}", "", str(msg.get("content", "")), ""]
+        return "\n".join(lines)
+
+    def _build_json_export(self):
+        return json.dumps({
+            "id": self.session_id,
+            "title": self.session_title,
+            "created_at": self.session_created_at,
+            "updated_at": _now_iso(),
+            "system_prompt": self.system_prompt,
+            "model": self.model_var.get(),
+            "messages": self.conversation,
+        }, ensure_ascii=False, indent=2)
+
+    def _build_text_export(self):
+        lines = [f"oChat session: {self.session_title}",
+                 f"Model: {self.model_var.get()}", ""]
+        if self.system_prompt:
+            lines += [f"System prompt: {self.system_prompt}", ""]
+        lines.append("=" * 60)
+        for msg in self.conversation:
+            sender = {"user": "You", "assistant": "oChat", "system": "System"}.get(
+                msg.get("role"), msg.get("role") or "?")
+            lines += ["", f"[{sender}]", str(msg.get("content", ""))]
+        lines.append("")
+        return "\n".join(lines)
+
     def on_send(self):
         user_input = self.input_text.get('1.0', END).strip()
         if not user_input and not self.current_image_base64:
@@ -303,13 +629,25 @@ class oChatGUI:
         else:
             self.conversation.append({"role": "user", "content": message_content})
         
+        # Auto-name the session from the first user message
+        if len(self.conversation) == 1 and self.session_title == "New Chat":
+            title = (user_message or "Image analysis").replace("\n", " ")[:40].strip()
+            if title:
+                self.session_title = title
+                self.session_title_var.set(title)
+
+        # Persist history immediately (also covers closing mid-request)
+        self._save_session()
+
         # Clear input after sending
         self.input_text.delete('1.0', END)
         self.update_status("⏳ Thinking...")
         
         # Disable input while processing
         self.input_text.config(state='disabled')
-        threading.Thread(target=self.send_and_receive, daemon=True).start()
+        # Snapshot Tk state on the main thread, then hand the request to a worker
+        model = self.model_var.get()
+        threading.Thread(target=self.send_and_receive, args=(model,), daemon=True).start()
 
     def append_chat(self, sender, message):
         """Append a message to the chat display"""
@@ -334,12 +672,17 @@ class oChatGUI:
         self.chat_text.tag_config("system", foreground="#ea4335")
         self.chat_text.tag_config("error", foreground="#ff0000")
 
-    def send_and_receive(self):
-        """Send request to Ollama and handle response"""
-        model = self.model_var.get()
+    def send_and_receive(self, model):
+        """Send request to Ollama and handle response (runs on a worker thread).
+
+        `model` is snapshotted by the caller on the main thread; worker threads
+        must never touch Tk objects directly.
+        """
         
-        # Prepare messages for Ollama API
+        # Prepare messages for Ollama API (system prompt first, then chat history)
         messages = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
         for msg in self.conversation:
             # Skip images in messages (they're handled separately)
             clean_msg = {k: v for k, v in msg.items() if k != "images"}
@@ -378,6 +721,7 @@ class oChatGUI:
                 assistant_msg = data.get("message", {}).get("content", "")
                 if assistant_msg:
                     self.conversation.append({"role": "assistant", "content": assistant_msg})
+                    self._schedule(self._save_session)  # persist history
                     self._schedule(lambda: self.append_chat("oChat", assistant_msg))
                     self._schedule(lambda: self.update_status("✅ Done"))
                 else:
@@ -412,6 +756,9 @@ if __name__ == "__main__":
     gui.append_chat("System", "🖼️ Click 'Attach' to add an image")
     gui.append_chat("System", "💡 Tip: Use LLaVA model for best image understanding")
     gui.append_chat("System", "⌨️  Press Enter to send, Shift+Enter for new line")
+    gui.append_chat("System", "💾 Chat history autosaves into the 'sessions' folder")
+    gui.append_chat("System", "⚙ Session menu: new/open/delete chats + system prompt")
+    gui.append_chat("System", "📤 Export history: File → Export as…")
     gui.update_status("Ready")
     
     root.mainloop()

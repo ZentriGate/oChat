@@ -15,3 +15,6 @@ env/
 
 # Logs
 *.log
+
+# App data (chat history)
+sessions/
