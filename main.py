@@ -707,6 +707,34 @@ class oChatGUI:
         self.chat_text.see(END)
         self.chat_text.configure(state='disabled')
 
+    def _handle_http_error(self, r, payload, model, tools):
+        """Show a clear, actionable error for a failed /api/chat response."""
+        # Ollama wraps errors in JSON: {"error": "..."} — extract it cleanly.
+        raw_error = r.text[:400] if r else ""
+        if r is not None:
+            try:
+                data = r.json()
+                if isinstance(data, dict) and data.get("error"):
+                    raw_error = str(data["error"])[:400]
+            except Exception:
+                pass
+
+        if tools and "does not support tools" in raw_error.lower():
+            note = (f"Model '{model}' does not support tool calling, so Agent "
+                    "mode cannot call tools with it.\n\n"
+                    "Options:\n"
+                    "• Pick a tools-capable model (e.g. qwen2.5-coder, llama3.1/3.3, "
+                    "qwen2.5) in the dropdown and send again.\n"
+                    "• Or turn agent mode off: Session → Agent Settings → Policy = "
+                    "'Off (plain chat)' — it will answer like a normal chat.")
+            self._schedule(lambda n=note: self.append_chat("Error", f"❌ {n}"))
+            self._schedule(lambda: self.update_status("⚠️ Model has no tool support"))
+            return
+
+        error_text = f"Error {r.status_code}: {raw_error}"
+        self._schedule(lambda e=error_text: self.append_chat("Error", f"❌ {e}"))
+        self._schedule(lambda: self.update_status(f"⚠️ Error {r.status_code}"))
+
     def _execute_tool(self, name, args):
         """Execute one tool call inside the workspace. Returns a text result."""
         workspace = self.agent_config.get("workspace", "")
@@ -1122,9 +1150,7 @@ class oChatGUI:
                     return
 
                 if r.status_code != 200:
-                    error_text = f"Error {r.status_code}: {r.text[:200]}"
-                    self._schedule(lambda: self.append_chat("Error", f"❌ {error_text}"))
-                    self._schedule(lambda: self.update_status(f"⚠️ Error {r.status_code}"))
+                    self._handle_http_error(r, payload, model, tools)
                     r.close()
                     return
 
@@ -1188,8 +1214,15 @@ class oChatGUI:
                     continue
 
                 if not assistant_msg:
-                    msg = ("❌ Agent stopped without a final text answer."
-                           if tool_round else "❌ No response from Ollama")
+                    if tool_round:
+                        msg = "❌ Agent stopped without a final text answer."
+                    elif tools:
+                        msg = ("❌ The model returned nothing and made no tool call. "
+                               "It may not support tool calling — switch to a "
+                               "tools-capable model (e.g. qwen2.5-coder, llama3.3) "
+                               "or set Agent policy to 'Off'.")
+                    else:
+                        msg = "❌ No response from Ollama"
                     if seen_any[0]:
                         self._schedule(lambda: self._stream_tail())
                     self._schedule(lambda m=msg: self.append_chat("Error", m))
