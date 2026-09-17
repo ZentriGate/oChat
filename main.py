@@ -168,6 +168,9 @@ class oChatGUI:
         self.agent_config.setdefault("command_timeout", DEFAULT_COMMAND_TIMEOUT)
         self.agent_config.setdefault("api_timeout", DEFAULT_API_TIMEOUT)
 
+        # Ollama-reported model capabilities (name -> set of capability strings)
+        self._model_caps = {}
+
         # Menu bar: File (export) and Session (history / system prompt)
         menubar = Menu(root)
         file_menu = Menu(menubar, tearoff=0)
@@ -341,13 +344,23 @@ class oChatGUI:
         self.input_text.delete('1.0', END)
 
     def get_models(self):
-        """Fetch available models from Ollama"""
+        """Fetch available models and their capabilities from Ollama."""
+        caps = {}
         try:
             r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
             if r.status_code == 200:
                 data = r.json()
-                models = [model["name"] for model in data.get("models", [])]
+                models = []
+                for model in data.get("models", []):
+                    name = model.get("name")
+                    if not name:
+                        continue
+                    models.append(name)
+                    cap_list = model.get("capabilities")
+                    if isinstance(cap_list, list):
+                        caps[name] = {str(c) for c in cap_list}
                 if models:
+                    self._model_caps = caps
                     return models
                 else:
                     self.update_status("No models found. Please pull a model with 'ollama pull <model>'")
@@ -358,6 +371,7 @@ class oChatGUI:
         except Exception as e:
             self.update_status(f"⚠️ Error: {str(e)[:50]}")
             print("Error fetching models:", e)
+        self._model_caps = caps
         return [DEFAULT_MODEL]
 
     def refresh_models(self):
@@ -368,6 +382,10 @@ class oChatGUI:
         if self.model_var.get() not in models and models:
             self.model_var.set(models[0])
         self.update_status(f"Loaded {len(models)} model(s)")
+
+    def _tools_capable_models(self):
+        """Names of installed models that Ollama reports as tool-capable (best effort)."""
+        return sorted(name for name, cap_set in self._model_caps.items() if "tools" in cap_set)
 
     def attach_image(self):
         """Open file dialog to select an image"""
@@ -720,13 +738,19 @@ class oChatGUI:
                 pass
 
         if tools and "does not support tools" in raw_error.lower():
-            note = (f"Model '{model}' does not support tool calling, so Agent "
-                    "mode cannot call tools with it.\n\n"
-                    "Options:\n"
-                    "• Pick a tools-capable model (e.g. qwen2.5-coder, llama3.1/3.3, "
-                    "qwen2.5) in the dropdown and send again.\n"
-                    "• Or turn agent mode off: Session → Agent Settings → Policy = "
-                    "'Off (plain chat)' — it will answer like a normal chat.")
+            note = (f"Model '{model}' does not support tool calling, so Agent mode "
+                    "cannot call tools with it.\n\n"
+                    "Options:\n")
+            capable = self._tools_capable_models()
+            if capable:
+                note += ("• Tool-capable models you currently have:\n"
+                         + "".join(f"    - {m}\n" for m in capable)
+                         + "  Select one of those and send again.\n")
+            else:
+                note += ("• Pick a model known to support tool calling (check the "
+                         "model card on ollama.com) and send again.\n")
+            note += ("• Or turn agent mode off: Session → Agent Settings → Policy = "
+                     "'Off (plain chat)' — it will answer like a normal chat.")
             self._schedule(lambda n=note: self.append_chat("Error", f"❌ {n}"))
             self._schedule(lambda: self.update_status("⚠️ Model has no tool support"))
             return
@@ -1217,10 +1241,16 @@ class oChatGUI:
                     if tool_round:
                         msg = "❌ Agent stopped without a final text answer."
                     elif tools:
-                        msg = ("❌ The model returned nothing and made no tool call. "
-                               "It may not support tool calling — switch to a "
-                               "tools-capable model (e.g. qwen2.5-coder, llama3.3) "
-                               "or set Agent policy to 'Off'.")
+                        capable = self._tools_capable_models()
+                        if capable:
+                            msg = ("❌ The model returned nothing and made no tool call. "
+                                   f"It may not support tool calling — try one of your "
+                                   f"tool-capable models ({', '.join(capable)}) or set "
+                                   f"Agent policy to 'Off'.")
+                        else:
+                            msg = ("❌ The model returned nothing and made no tool call. "
+                                   "It may not support tool calling — switch to a "
+                                   "tools-capable model or set Agent policy to 'Off'.")
                     else:
                         msg = "❌ No response from Ollama"
                     if seen_any[0]:
