@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from tkinter import (Tk, Text, Button, Entry, END, LEFT, RIGHT, BOTH, X, Frame,
-                     ttk, Scrollbar, VERTICAL, Y, StringVar, filedialog,
+                     ttk, Scrollbar, VERTICAL, Y, StringVar, BooleanVar, filedialog,
                      messagebox, Menu, Toplevel)
 from PIL import Image, ImageTk
 
@@ -241,6 +241,7 @@ class oChatGUI:
         self.agent_config.setdefault("command_timeout", DEFAULT_COMMAND_TIMEOUT)
         self.agent_config.setdefault("api_timeout", DEFAULT_API_TIMEOUT)
         self.agent_config.setdefault("max_context_chars", DEFAULT_CONTEXT_CHARS)
+        self.agent_config.setdefault("disable_thinking", False)
 
         # Ollama-reported model capabilities (name -> set of capability strings)
         self._model_caps = {}
@@ -700,7 +701,7 @@ class oChatGUI:
         """Dialog: workspace directory, policy level, and timeouts."""
         dialog = Toplevel(self.root)
         dialog.title("Agent Settings")
-        dialog.geometry("520x300")
+        dialog.geometry("520x335")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -714,6 +715,8 @@ class oChatGUI:
             value=str(self.agent_config.get("api_timeout", DEFAULT_API_TIMEOUT)))
         context_var = StringVar(
             value=str(self.agent_config.get("max_context_chars", DEFAULT_CONTEXT_CHARS)))
+        disable_thinking_var = BooleanVar(
+            value=bool(self.agent_config.get("disable_thinking", False)))
 
         row1 = Frame(dialog)
         row1.pack(fill=X, padx=10, pady=(8, 4))
@@ -750,6 +753,12 @@ class oChatGUI:
         ttk.Label(row5, text="older turns are trimmed to fit the model window",
                   font=("Arial", 8), foreground="#666666").pack(side=LEFT, padx=(4, 0))
 
+        row6 = Frame(dialog)
+        row6.pack(fill=X, padx=10, pady=4)
+        ttk.Checkbutton(row6,
+                        text="Disable reasoning/thinking (recommended for qwen3-style models)",
+                        variable=disable_thinking_var).pack(anchor='w')
+
         ttk.Label(dialog, foreground="#cc0000", justify=LEFT, wraplength=480,
                   font=("Arial", 8),
                   text="The model may only touch files inside the workspace. "
@@ -779,7 +788,8 @@ class oChatGUI:
                 ws = os.path.realpath(ws)
             self.agent_config.update({"workspace": ws, "policy": pol,
                                       "command_timeout": cmd_to, "api_timeout": api_to,
-                                      "max_context_chars": ctx_to})
+                                      "max_context_chars": ctx_to,
+                                      "disable_thinking": disable_thinking_var.get()})
             if not _save_config(self.agent_config):
                 messagebox.showwarning("Warning",
                                        "Could not write config.json — settings will not survive a restart.")
@@ -846,6 +856,28 @@ class oChatGUI:
         error_text = f"Error {r.status_code}: {raw_error}"
         self._schedule(lambda e=error_text: self.append_chat("Error", f"❌ {e}"))
         self._schedule(lambda: self.update_status(f"⚠️ Error {r.status_code}"))
+
+    def _probe_engine(self, model):
+        """Tiny no-tools ping to tell 'model refusing' apart from 'engine stalled'."""
+        try:
+            r = requests.post(
+                f"{OLLAMA_HOST}/api/chat",
+                json={"model": model,
+                      "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+                      "stream": False},
+                timeout=(5, 20))
+            if r.status_code != 200:
+                return False
+            try:
+                data = r.json()
+            except Exception:
+                return False
+            if isinstance(data, dict):
+                txt = (data.get("message") or {}).get("content", "")
+                return bool(txt and txt.strip())
+            return False
+        except Exception:
+            return False
 
     def _execute_tool(self, name, args):
         """Execute one tool call inside the workspace. Returns a text result."""
@@ -1270,6 +1302,10 @@ class oChatGUI:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if self.agent_config.get("disable_thinking", False):
+            # Reasoning models (qwen3-style) burn context on internal thinking and
+            # may return empty completions when the window is tight.
+            payload["thinking"] = {"type": "disabled"}
 
         # Add images if present (only for the latest user message)
         if self.current_image_base64 and messages:
@@ -1286,11 +1322,13 @@ class oChatGUI:
         try:
             api_timeout = int(self.agent_config.get("api_timeout", DEFAULT_API_TIMEOUT))
             budget_chars = int(self.agent_config.get("max_context_chars", DEFAULT_CONTEXT_CHARS))
+            history_budget = budget_chars * 3 // 4  # headroom for thinking + output
             tool_round = 0
             tools_dropped = False
             agent_rounds = 0
             finished = False
             finish_summary = ""
+            stream_cuts = 0
 
             while True:
                 if finished:
@@ -1331,7 +1369,7 @@ class oChatGUI:
 
                 # Keep the exchange inside the model's context window: trim the
                 # oldest full turns once the budget is exceeded.
-                trimmed = _trim_messages(messages, budget_chars)
+                trimmed = _trim_messages(messages, history_budget)
                 if trimmed is not messages:
                     messages[:] = trimmed
                 try:
@@ -1358,6 +1396,7 @@ class oChatGUI:
                 # Consume the NDJSON stream: {"message": {"content": "..."}, "done": bool}
                 final_message = {}
                 streamed_tool_calls = None  # some servers send tool_calls pre-done
+                stream_completed = False
                 try:
                     with r:
                         for raw in r.iter_lines(decode_unicode=True):
@@ -1375,6 +1414,7 @@ class oChatGUI:
                                 streamed_tool_calls = tc
                             if obj.get("done"):
                                 final_message = message
+                                stream_completed = True
                                 break
                 except requests.exceptions.Timeout:
                     # Mid-stream silence: partial output is already on screen; do not
@@ -1387,6 +1427,17 @@ class oChatGUI:
                     if seen_any[0]:
                         self._schedule(lambda: self._stream_tail())
                     return
+
+                # The engine cut the stream without a completion marker and sent
+                # nothing at all — usually a transient Ollama hiccup: retry once.
+                if not stream_completed and not chunk_parts and not streamed_tool_calls:
+                    if stream_cuts == 0:
+                        stream_cuts = 1
+                        self._schedule(lambda: self.append_chat(
+                            "System", "⚠️ Response ended without a completion "
+                            "marker — retrying once."))
+                        self._schedule(lambda: self.update_status("⏳ Retrying after truncated stream…"))
+                        continue
 
                 assistant_msg = "".join(chunk_parts)
                 # Prefer tool calls seen on ANY stream line (some servers only send
@@ -1458,10 +1509,17 @@ class oChatGUI:
                         continue
 
                     if tools_dropped:
-                        msg = ("❌ The model returned nothing twice in a row. "
-                               "With a long session this is usually context "
-                               "overflow — try Session → New Session, or lower "
-                               "the agent's context budget.")
+                        if self._probe_engine(model):
+                            msg = ("❌ The model returned nothing twice, yet a "
+                                   "probe ping succeeded — the engine is healthy, "
+                                   "so the model itself may be refusing or out of "
+                                   "room. Try a different model or lower the "
+                                   "context budget.")
+                        else:
+                            msg = ("❌ The model returned nothing twice AND a probe "
+                                   "ping failed — the Ollama engine looks stalled. "
+                                   "Check `ollama ps` and the server logs, then try "
+                                   "again.")
                     elif tool_round:
                         msg = "❌ Agent stopped without a final text answer."
                     elif tools:

@@ -87,8 +87,14 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
   cap is hit), so a single analysis step no longer ends the task.
 - **Context management:** huge file reads are truncated to a head+tail excerpt,
   and a configurable *Context budget* (default 80 000 chars ≈ 20–24k tokens)
-  trims the oldest turns from each request so the model's window never fills
-  up mid-refactor.
+  trims the oldest turns from each request — using only ~75% of the budget so
+  reasoning models still have room to think and answer.
+- **Reasoning models:** tick *Disable reasoning/thinking* in Agent Settings to
+  send `thinking: disabled` for qwen3-style models (they otherwise burn the
+  context window on internal thinking and can return empty replies).
+- **Engine hiccups:** a stream that ends without a completion marker is retried
+  once; if the model twice returns nothing, oChat pings the engine to tell
+  *"model refusing"* apart from *"Ollama stalled"* (`ollama ps` / logs).
 
 > ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
 > commands in the workspace. Only enable it in a directory you trust.
