@@ -37,6 +37,7 @@ DEFAULT_API_TIMEOUT = 600       # seconds of silence before a streaming request 
 DEFAULT_CONTEXT_CHARS = 80000   # context budget; oldest turns are trimmed past this
 MAX_TOOL_ITERATIONS = 12        # cap on tool-call rounds per request
 MAX_AGENT_ROUNDS = 30           # total tool + narration rounds per agent request
+MAX_EMPTY_RECOVERIES = 2        # targeted 'continue' nudges before dropping tools
 TOOL_OUTPUT_LIMIT = 12000       # chars of a tool result returned to the model
 
 POLICY_LABELS = {
@@ -176,11 +177,13 @@ def _resolve_in_workspace(workspace, path_arg):
 
 
 def _trim_messages(messages, budget_chars):
-    """Trim oldest full turns so the request fits within budget_chars.
+    """Trim oldest history so the request fits within budget_chars.
 
-    Always keeps the system prompt, the newest user turn, and never splits an
-    assistant tool-call message from its tool results (cuts only at user turns).
-    Returns the same list when nothing needs trimming, so callers can test identity.
+    Cuts only at COMPLETE user turns (a user message that has a following
+    reply), so assistant tool-call messages and tool results are never split
+    off, and a trailing bare user message (e.g. an auto-continue nudge) never
+    becomes the anchor that wipes the real conversation. Returns the same list
+    when nothing needs trimming, so callers can test identity.
     """
     if budget_chars <= 0 or not messages:
         return messages
@@ -192,16 +195,15 @@ def _trim_messages(messages, budget_chars):
     for i, m in enumerate(messages):
         sizes[i + 1] = sizes[i] + len(str(m.get("content", "")))
 
+    candidates = [i for i in range(len(messages))
+                  if messages[i].get("role") == "user" and i + 1 < len(messages)]
     keep_start = None
-    for i in range(len(messages) - 1, -1, -1):  # newest fitting user turn wins
-        if messages[i].get("role") == "user" and total - sizes[i] <= budget_chars:
+    for i in reversed(candidates):
+        if total - sizes[i] <= budget_chars:
             keep_start = i
             break
-    if keep_start is None:  # not even the newest turn fits - keep it anyway
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                keep_start = i
-                break
+    if keep_start is None and candidates:
+        keep_start = candidates[-1]  # newest complete turn even if over budget
     if keep_start is None or keep_start <= 1:
         return messages  # nothing safe to cut
 
@@ -1265,6 +1267,8 @@ class oChatGUI:
         
         # Agent mode: resolve tools up-front so the system prompt and loop can use it
         tools = _tools_for_policy(self.agent_config.get("policy", "off"))
+        budget_chars = int(self.agent_config.get("max_context_chars", DEFAULT_CONTEXT_CHARS))
+        history_budget = budget_chars * 3 // 4  # leave headroom for thinking + output
 
         # Prepare messages for Ollama API (system prompt first, then chat history)
         messages = []
@@ -1295,7 +1299,10 @@ class oChatGUI:
             "stream": True,
             "options": {
                 "temperature": 0.7,
-                "top_p": 0.9
+                "top_p": 0.9,
+                # Keep the served window at least as large as the history we send,
+                # so Ollama never silently mid-truncates the conversation.
+                "num_ctx": min(65536, max(4096, budget_chars // 3))
             }
         }
         
@@ -1321,8 +1328,8 @@ class oChatGUI:
         
         try:
             api_timeout = int(self.agent_config.get("api_timeout", DEFAULT_API_TIMEOUT))
-            budget_chars = int(self.agent_config.get("max_context_chars", DEFAULT_CONTEXT_CHARS))
-            history_budget = budget_chars * 3 // 4  # headroom for thinking + output
+            current_budget = history_budget  # tightened on empty-recovery rounds
+            recovery_nudges = 0
             tool_round = 0
             tools_dropped = False
             agent_rounds = 0
@@ -1369,7 +1376,7 @@ class oChatGUI:
 
                 # Keep the exchange inside the model's context window: trim the
                 # oldest full turns once the budget is exceeded.
-                trimmed = _trim_messages(messages, history_budget)
+                trimmed = _trim_messages(messages, current_budget)
                 if trimmed is not messages:
                     messages[:] = trimmed
                 try:
@@ -1498,25 +1505,39 @@ class oChatGUI:
                     # a tool call nor any text — retry once WITHOUT tools so the
                     # conversation doesn't stall on an empty reply.
                     if tools and not tools_dropped:
+                        if recovery_nudges < MAX_EMPTY_RECOVERIES:
+                            # Reasoning models often return an empty completion right
+                            # after a tool result — nudge to continue, KEEPING tools.
+                            recovery_nudges += 1
+                            current_budget = max(2000, current_budget // 2)
+                            self._schedule(lambda n=recovery_nudges: self.append_chat(
+                                "System", f"⚠️ Empty reply — nudging the model to "
+                                f"continue (attempt {n}/{MAX_EMPTY_RECOVERIES})."))
+                            self._schedule(lambda: self.update_status("⚠️ Empty — nudging…"))
+                            messages.append({"role": "user",
+                                             "content": "Continue. The previous tool "
+                                             "results are available; if the task is "
+                                             "finished, call task_complete(summary)."})
+                            continue
                         tools_dropped = True
                         tools = []
                         payload.pop("tools", None)
                         payload.pop("tool_choice", None)
                         self._schedule(lambda: self.append_chat(
-                            "System", "⚠️ Model returned no tool call and no text — "
+                            "System", "⚠️ Model still returning empty replies — "
                             "retrying without tool calling."))
                         self._schedule(lambda: self.update_status("⏳ Retrying without tools…"))
                         continue
 
                     if tools_dropped:
                         if self._probe_engine(model):
-                            msg = ("❌ The model returned nothing twice, yet a "
+                            msg = ("❌ The model repeatedly returned nothing (after recovery nudges), yet a "
                                    "probe ping succeeded — the engine is healthy, "
                                    "so the model itself may be refusing or out of "
                                    "room. Try a different model or lower the "
                                    "context budget.")
                         else:
-                            msg = ("❌ The model returned nothing twice AND a probe "
+                            msg = ("❌ The model repeatedly returned nothing (after recovery nudges) AND a probe "
                                    "ping failed — the Ollama engine looks stalled. "
                                    "Check `ollama ps` and the server logs, then try "
                                    "again.")

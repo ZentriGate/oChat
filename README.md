@@ -93,8 +93,13 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
   send `thinking: disabled` for qwen3-style models (they otherwise burn the
   context window on internal thinking and can return empty replies).
 - **Engine hiccups:** a stream that ends without a completion marker is retried
-  once; if the model twice returns nothing, oChat pings the engine to tell
-  *"model refusing"* apart from *"Ollama stalled"* (`ollama ps` / logs).
+  once; if the model returns empty completions, oChat sends up to two targeted
+  recovery nudges (keeping tools active, halving the context budget each time)
+  before dropping tools — and if it repeatedly returns nothing, it pings the
+  engine to tell *"model refusing / out of room"* apart from *"Ollama stalled"*
+  (`ollama ps` / logs).
+- `num_ctx` is pinned to the context budget so Ollama never silently
+  mid-truncates the history oChat sends.
 
 > ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
 > commands in the workspace. Only enable it in a directory you trust.
