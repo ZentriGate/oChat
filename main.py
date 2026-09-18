@@ -6,6 +6,7 @@ import os
 import json
 import shutil
 import subprocess
+import time
 from datetime import datetime
 from tkinter import (Tk, Text, Button, Entry, END, LEFT, RIGHT, BOTH, X, Frame,
                      ttk, Scrollbar, VERTICAL, Y, StringVar, BooleanVar, filedialog,
@@ -38,6 +39,7 @@ DEFAULT_CONTEXT_CHARS = 80000   # context budget; oldest turns are trimmed past 
 MAX_TOOL_ITERATIONS = 12        # cap on tool-call rounds per request
 MAX_AGENT_ROUNDS = 30           # total tool + narration rounds per agent request
 MAX_EMPTY_RECOVERIES = 2        # targeted 'continue' nudges before dropping tools
+MAX_STALLED_NARRATIONS = 3      # abort when the model narrates without any tool call
 TOOL_OUTPUT_LIMIT = 12000       # chars of a tool result returned to the model
 
 POLICY_LABELS = {
@@ -1330,6 +1332,7 @@ class oChatGUI:
             api_timeout = int(self.agent_config.get("api_timeout", DEFAULT_API_TIMEOUT))
             current_budget = history_budget  # tightened on empty-recovery rounds
             recovery_nudges = 0
+            narration_streak = 0  # consecutive text-only rounds with no tool call
             tool_round = 0
             tools_dropped = False
             agent_rounds = 0
@@ -1379,9 +1382,24 @@ class oChatGUI:
                 trimmed = _trim_messages(messages, current_budget)
                 if trimmed is not messages:
                     messages[:] = trimmed
+                # Transient Ollama restarts/OOM are common on local hosts: retry
+                # short-lived connection failures with a short backoff.
+                connect_attempts = 0
                 try:
-                    r = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload,
-                                      stream=True, timeout=(10, api_timeout))
+                    while True:
+                        try:
+                            r = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload,
+                                              stream=True, timeout=(10, api_timeout))
+                            break
+                        except requests.exceptions.ConnectionError:
+                            connect_attempts += 1
+                            if connect_attempts > 2:
+                                raise
+                            self._schedule(lambda a=connect_attempts: self.append_chat(
+                                "System", f"🔌 Connection to Ollama lost — reconnecting "
+                                f"(attempt {a}/2)…"))
+                            self._schedule(lambda: self.update_status("🔌 Reconnecting…"))
+                            time.sleep(2 * connect_attempts)
                 except requests.exceptions.Timeout:
                     if not retried[0] and not seen_any[0]:
                         # The round never started producing output — safe to retry once
@@ -1455,6 +1473,7 @@ class oChatGUI:
                 if tools and tool_calls and tool_round < MAX_TOOL_ITERATIONS:
                     tool_round += 1
                     agent_rounds += 1
+                    narration_streak = 0  # real tool activity resets the stall counter
                     if seen_any[0]:
                         self._schedule(lambda: self._stream_tail())
                     messages.append({"role": "assistant", "content": assistant_msg,
@@ -1571,8 +1590,18 @@ class oChatGUI:
 
                 if tools:
                     # Agent mode: narration is not the end — keep going autonomously
-                    # until the model calls task_complete or the round limit.
+                    # until the model calls task_complete or a stuck/round limit hits.
                     agent_rounds += 1
+                    narration_streak += 1
+                    if narration_streak >= MAX_STALLED_NARRATIONS:
+                        self._schedule(lambda n=narration_streak: self.append_chat(
+                            "Error", f"⏹ The model responded {n} times in a row "
+                            "without calling any tool — it appears stuck in "
+                            "narration. Try Session → New Session, a lower "
+                            "Context budget, or a larger model, then resend the "
+                            "task."))
+                        self._schedule(lambda: self.update_status("⏹ Stuck in narration"))
+                        return
                     if agent_rounds >= MAX_AGENT_ROUNDS:
                         self._schedule(lambda: self.append_chat(
                             "Error", f"⏹ Reached the {MAX_AGENT_ROUNDS}-round agent "
@@ -1584,9 +1613,15 @@ class oChatGUI:
                     self._schedule(lambda: self.append_chat(
                         "System", "⏭ Continuing autonomously…"))
                     messages.append({"role": "assistant", "content": assistant_msg})
-                    messages.append({"role": "user",
-                                     "content": "Continue. Work until the whole "
-                                     "task is complete, then call task_complete(summary)."})
+                    if narration_streak >= 2:
+                        nudge = ("Stop describing what you will do. You must use "
+                                 "the tools NOW to actually perform the work, step "
+                                 "by step. If the task is truly finished, call "
+                                 "task_complete(summary).")
+                    else:
+                        nudge = ("Continue. Work until the whole task is complete, "
+                                 "then call task_complete(summary).")
+                    messages.append({"role": "user", "content": nudge})
                     continue
 
                 # Plain chat (no tools): this text IS the final answer.

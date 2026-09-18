@@ -100,6 +100,12 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
   (`ollama ps` / logs).
 - `num_ctx` is pinned to the context budget so Ollama never silently
   mid-truncates the history oChat sends.
+- **Stall detection:** if the model produces 3 consecutive narration replies
+  without calling any tool, oChat stops and suggests a New Session / lower
+  budget / larger model (the second nudge explicitly commands it to start
+  using tools).
+- **Resilience:** transient connection drops when Ollama restarts or OOMs are
+  retried up to 2× with backoff before showing *"Cannot connect"*.
 
 > ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
 > commands in the workspace. Only enable it in a directory you trust.
