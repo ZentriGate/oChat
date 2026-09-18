@@ -79,6 +79,12 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
   against the workspace root — attempts to escape (`../`, symlinks, absolute
   paths) are refused.
 - Tool activity is logged in the chat so you can always see what the agent did.
+- Tools include `list_dir`, `read_file` (+ `write_file`, `edit_file`, `mkdir`,
+  `delete_file`, `copy_file`, `move_file` for write/shell, `run_command` for
+  shell) and a `task_complete(summary)` signal.
+- The agent works **autonomously**: oChat keeps prompting it with *Continue*
+  between steps until it calls `task_complete(summary)` (or a 30-round safety
+  cap is hit), so a single analysis step no longer ends the task.
 
 > ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
 > commands in the workspace. Only enable it in a directory you trust.

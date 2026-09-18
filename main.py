@@ -4,6 +4,7 @@ import requests
 import base64
 import os
 import json
+import shutil
 import subprocess
 from datetime import datetime
 from tkinter import (Tk, Text, Button, Entry, END, LEFT, RIGHT, BOTH, X, Frame,
@@ -34,6 +35,7 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DEFAULT_COMMAND_TIMEOUT = 120   # seconds for a shell tool (run_command)
 DEFAULT_API_TIMEOUT = 600       # seconds of silence before a streaming request is dropped
 MAX_TOOL_ITERATIONS = 12        # cap on tool-call rounds per request
+MAX_AGENT_ROUNDS = 30           # total tool + narration rounds per agent request
 TOOL_OUTPUT_LIMIT = 12000       # chars of a tool result returned to the model
 
 POLICY_LABELS = {
@@ -117,14 +119,43 @@ def _tools_for_policy(policy):
         "builds, tests, and quick checks.",
         {"command": {"type": "string", "description": "Shell command to run in the workspace"}},
         ["command"])
+    mkdir = _tool(
+        "mkdir",
+        "Create a directory (and any missing parents) inside the workspace.",
+        {"path": {"type": "string", "description": "Directory path relative to the workspace"}},
+        ["path"])
+    delete_file = _tool(
+        "delete_file",
+        "Delete a file inside the workspace (not a directory).",
+        {"path": {"type": "string", "description": "File path relative to the workspace"}},
+        ["path"])
+    copy_file = _tool(
+        "copy_file",
+        "Copy a file inside the workspace (creating parent directories if needed).",
+        {"source": {"type": "string", "description": "Source path relative to the workspace"},
+         "destination": {"type": "string", "description": "Destination path relative to the workspace"}},
+        ["source", "destination"])
+    move_file = _tool(
+        "move_file",
+        "Move or rename a file inside the workspace (creating parent directories if needed).",
+        {"source": {"type": "string", "description": "Source path relative to the workspace"},
+         "destination": {"type": "string", "description": "Destination path relative to the workspace"}},
+        ["source", "destination"])
+    task_complete = _tool(
+        "task_complete",
+        "Call this ONLY when the entire user request is finished. Provide a "
+        "short summary of everything that was done. Do NOT call it after "
+        "single steps — the task is complete only when all steps are done.",
+        {"summary": {"type": "string", "description": "Summary of everything completed"}},
+        ["summary"])
 
-    base = [list_dir, read_file]
+    base = [list_dir, read_file, task_complete]
     if policy == "read":
         return base
     if policy == "write":
-        return base + [write_file, edit_file]
+        return base + [write_file, edit_file, mkdir, delete_file, copy_file, move_file]
     if policy == "shell":
-        return base + [write_file, edit_file, run_command]
+        return base + [write_file, edit_file, mkdir, delete_file, copy_file, move_file, run_command]
     return []  # "off"
 
 
@@ -843,6 +874,55 @@ class oChatGUI:
                 return f"Error writing {pth}: {e}"
             return f"Edited {pth}: replaced the first occurrence."
 
+        if name == "mkdir":
+            try:
+                pth = _resolve_in_workspace(workspace, args.get("path", ""))
+            except ValueError as e:
+                return str(e)
+            if os.path.exists(pth) and not os.path.isdir(pth):
+                return f"Error: '{pth}' already exists and is not a directory."
+            try:
+                os.makedirs(pth, exist_ok=True)
+            except OSError as e:
+                return f"Error creating {pth}: {e}"
+            return f"Created directory {pth}"
+
+        if name == "delete_file":
+            try:
+                pth = _resolve_in_workspace(workspace, args.get("path", ""))
+            except ValueError as e:
+                return str(e)
+            if not os.path.isfile(pth):
+                return f"Error: '{pth}' is not a file."
+            try:
+                os.remove(pth)
+            except OSError as e:
+                return f"Error deleting {pth}: {e}"
+            return f"Deleted {pth}"
+
+        if name in ("copy_file", "move_file"):
+            try:
+                src = _resolve_in_workspace(workspace, args.get("source", ""))
+                dst = _resolve_in_workspace(workspace, args.get("destination", ""))
+            except ValueError as e:
+                return str(e)
+            if not os.path.isfile(src):
+                return f"Error: source '{src}' is not a file."
+            if os.path.isdir(dst):
+                dst = os.path.join(dst, os.path.basename(src))
+            try:
+                os.makedirs(os.path.dirname(dst) or workspace, exist_ok=True)
+                if name == "copy_file":
+                    shutil.copy2(src, dst)
+                else:
+                    shutil.move(src, dst)
+            except OSError as e:
+                return f"Error {name} {src} -> {dst}: {e}"
+            return f"{'Copied' if name == 'copy_file' else 'Moved'} {src} -> {dst}"
+
+        if name == "task_complete":
+            return "Task marked complete."
+
         if name == "run_command":
             cmd = args.get("command", "")
             if not cmd:
@@ -1088,10 +1168,24 @@ class oChatGUI:
         must never touch Tk objects directly.
         """
         
+        # Agent mode: resolve tools up-front so the system prompt and loop can use it
+        tools = _tools_for_policy(self.agent_config.get("policy", "off"))
+
         # Prepare messages for Ollama API (system prompt first, then chat history)
         messages = []
+        system_parts = []
         if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
+            system_parts.append(self.system_prompt)
+        if tools:
+            system_parts.append(
+                "You are an autonomous coding agent. Work through the user's "
+                "request COMPLETELY, step by step, using the provided tools. "
+                "Never stop after a single analysis step and never ask for "
+                "permission between steps — keep using tools until the entire "
+                "task is finished. Only when everything is done, call "
+                "task_complete(summary) with a concise report of what changed.")
+        if system_parts:
+            messages.append({"role": "system", "content": "\n\n".join(system_parts)})
         for msg in self.conversation:
             # Skip images (handled separately); keep assistant tool-call narration
             # and tool results so follow-up turns have full context.
@@ -1110,8 +1204,6 @@ class oChatGUI:
             }
         }
         
-        # Enable tool calling (agent mode) when the configured policy declares tools
-        tools = _tools_for_policy(self.agent_config.get("policy", "off"))
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
@@ -1132,8 +1224,20 @@ class oChatGUI:
             api_timeout = int(self.agent_config.get("api_timeout", DEFAULT_API_TIMEOUT))
             tool_round = 0
             tools_dropped = False
+            agent_rounds = 0
+            finished = False
+            finish_summary = ""
 
             while True:
+                if finished:
+                    # task_complete was called — deliver its summary and stop
+                    final_text = finish_summary or "(task complete)"
+                    self.conversation.append({"role": "assistant", "content": final_text})
+                    self._schedule(self._save_session)
+                    self._schedule(lambda t=final_text: self.append_chat("oChat", t))
+                    self._schedule(lambda: self.update_status("✅ Done"))
+                    return
+
                 self._schedule(lambda: self.update_status(f"⏳ Sending to {model}..."))
                 # Streaming: tokens arrive progressively, so the API timeout only
                 # bounds *silence* between tokens — long generations stay alive.
@@ -1221,8 +1325,9 @@ class oChatGUI:
                 tool_calls = (final_message.get("tool_calls") or streamed_tool_calls or [])
 
                 # Agent mode: the model asked to use tools — execute and loop
-                if tool_calls and tool_round < MAX_TOOL_ITERATIONS:
+                if tools and tool_calls and tool_round < MAX_TOOL_ITERATIONS:
                     tool_round += 1
+                    agent_rounds += 1
                     if seen_any[0]:
                         self._schedule(lambda: self._stream_tail())
                     messages.append({"role": "assistant", "content": assistant_msg,
@@ -1245,7 +1350,12 @@ class oChatGUI:
                             args = {}
                         self._schedule(lambda n=name, a=args: self.append_chat(
                             "Tool", f"🔧 {n}({self._fmt_tool_args(a)})"))
-                        result = self._execute_tool(name, args)
+                        if name == "task_complete":
+                            finished = True
+                            finish_summary = str(args.get("summary", ""))
+                            result = "Task marked complete."
+                        else:
+                            result = self._execute_tool(name, args)
                         self._schedule(lambda r_=result: self.append_chat(
                             "Tool result", f"{r_[:1200]}"))
                         # Persist a bounded copy so sessions stay small
@@ -1254,6 +1364,13 @@ class oChatGUI:
                             limited += "\n...[result truncated]"
                         self.conversation.append({"role": "tool", "content": limited})
                         messages.append({"role": "tool", "content": result})
+                    if agent_rounds >= MAX_AGENT_ROUNDS and not finished:
+                        self._schedule(lambda: self.append_chat(
+                            "Error", f"⏹ Reached the {MAX_AGENT_ROUNDS}-round agent "
+                            "limit without task_complete — stopping. Send anything "
+                            "to let the agent continue."))
+                        self._schedule(lambda: self.update_status("⏹ Round limit"))
+                        return
                     continue
 
                 if not assistant_msg:
@@ -1262,6 +1379,7 @@ class oChatGUI:
                     # conversation doesn't stall on an empty reply.
                     if tools and not tools_dropped:
                         tools_dropped = True
+                        tools = []
                         payload.pop("tools", None)
                         payload.pop("tool_choice", None)
                         self._schedule(lambda: self.append_chat(
@@ -1291,12 +1409,35 @@ class oChatGUI:
                     self._schedule(lambda: self.update_status("⚠️ Empty response"))
                     return
 
+                # The model produced TEXT without a tool call.
                 self.conversation.append({"role": "assistant", "content": assistant_msg})
-                self._schedule(self._save_session)  # persist history
                 if seen_any[0]:
                     self._schedule(lambda: self._stream_tail())
                 else:
                     self._schedule(lambda a=assistant_msg: self.append_chat("oChat", a))
+
+                if tools:
+                    # Agent mode: narration is not the end — keep going autonomously
+                    # until the model calls task_complete or the round limit.
+                    agent_rounds += 1
+                    if agent_rounds >= MAX_AGENT_ROUNDS:
+                        self._schedule(lambda: self.append_chat(
+                            "Error", f"⏹ Reached the {MAX_AGENT_ROUNDS}-round agent "
+                            "limit without task_complete — stopping. Send anything "
+                            "to let the agent continue."))
+                        self._schedule(lambda: self.update_status("⏹ Round limit"))
+                        return
+                    self._schedule(self._save_session)  # durable progress
+                    self._schedule(lambda: self.append_chat(
+                        "System", "⏭ Continuing autonomously…"))
+                    messages.append({"role": "assistant", "content": assistant_msg})
+                    messages.append({"role": "user",
+                                     "content": "Continue. Work until the whole "
+                                     "task is complete, then call task_complete(summary)."})
+                    continue
+
+                # Plain chat (no tools): this text IS the final answer.
+                self._schedule(self._save_session)  # persist history
                 self._schedule(lambda: self.update_status("✅ Done"))
                 return
         except requests.exceptions.Timeout:
