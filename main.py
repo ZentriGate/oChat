@@ -34,6 +34,7 @@ def _session_path(session_id):
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DEFAULT_COMMAND_TIMEOUT = 120   # seconds for a shell tool (run_command)
 DEFAULT_API_TIMEOUT = 600       # seconds of silence before a streaming request is dropped
+DEFAULT_CONTEXT_CHARS = 80000   # context budget; oldest turns are trimmed past this
 MAX_TOOL_ITERATIONS = 12        # cap on tool-call rounds per request
 MAX_AGENT_ROUNDS = 30           # total tool + narration rounds per agent request
 TOOL_OUTPUT_LIMIT = 12000       # chars of a tool result returned to the model
@@ -174,6 +175,47 @@ def _resolve_in_workspace(workspace, path_arg):
     return candidate
 
 
+def _trim_messages(messages, budget_chars):
+    """Trim oldest full turns so the request fits within budget_chars.
+
+    Always keeps the system prompt, the newest user turn, and never splits an
+    assistant tool-call message from its tool results (cuts only at user turns).
+    Returns the same list when nothing needs trimming, so callers can test identity.
+    """
+    if budget_chars <= 0 or not messages:
+        return messages
+    total = sum(len(str(m.get("content", ""))) for m in messages)
+    if total <= budget_chars:
+        return messages
+
+    sizes = [0] * (len(messages) + 1)
+    for i, m in enumerate(messages):
+        sizes[i + 1] = sizes[i] + len(str(m.get("content", "")))
+
+    keep_start = None
+    for i in range(len(messages) - 1, -1, -1):  # newest fitting user turn wins
+        if messages[i].get("role") == "user" and total - sizes[i] <= budget_chars:
+            keep_start = i
+            break
+    if keep_start is None:  # not even the newest turn fits - keep it anyway
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                keep_start = i
+                break
+    if keep_start is None or keep_start <= 1:
+        return messages  # nothing safe to cut
+
+    trimmed = []
+    if messages[0].get("role") == "system":
+        trimmed.append(messages[0])
+    trimmed.append({"role": "system",
+                    "content": "[Earlier conversation was trimmed to fit the "
+                               "model's context window — continue from the "
+                               "remaining history.]"})
+    trimmed.extend(messages[keep_start:])
+    return trimmed
+
+
 class oChatGUI:
     def __init__(self, root):
         self.root = root
@@ -198,6 +240,7 @@ class oChatGUI:
         self.agent_config.setdefault("policy", "off")
         self.agent_config.setdefault("command_timeout", DEFAULT_COMMAND_TIMEOUT)
         self.agent_config.setdefault("api_timeout", DEFAULT_API_TIMEOUT)
+        self.agent_config.setdefault("max_context_chars", DEFAULT_CONTEXT_CHARS)
 
         # Ollama-reported model capabilities (name -> set of capability strings)
         self._model_caps = {}
@@ -657,7 +700,7 @@ class oChatGUI:
         """Dialog: workspace directory, policy level, and timeouts."""
         dialog = Toplevel(self.root)
         dialog.title("Agent Settings")
-        dialog.geometry("520x270")
+        dialog.geometry("520x300")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -669,6 +712,8 @@ class oChatGUI:
             value=str(self.agent_config.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)))
         api_timeout_var = StringVar(
             value=str(self.agent_config.get("api_timeout", DEFAULT_API_TIMEOUT)))
+        context_var = StringVar(
+            value=str(self.agent_config.get("max_context_chars", DEFAULT_CONTEXT_CHARS)))
 
         row1 = Frame(dialog)
         row1.pack(fill=X, padx=10, pady=(8, 4))
@@ -698,6 +743,13 @@ class oChatGUI:
         ttk.Label(row4, text="of silence — streaming keeps the request alive",
                   font=("Arial", 8), foreground="#666666").pack(side=LEFT, padx=(4, 0))
 
+        row5 = Frame(dialog)
+        row5.pack(fill=X, padx=10, pady=4)
+        ttk.Label(row5, text="Context budget (chars):", font=("Arial", 9)).pack(side=LEFT, padx=(0, 10))
+        Entry(row5, textvariable=context_var, width=8).pack(side=LEFT)
+        ttk.Label(row5, text="older turns are trimmed to fit the model window",
+                  font=("Arial", 8), foreground="#666666").pack(side=LEFT, padx=(4, 0))
+
         ttk.Label(dialog, foreground="#cc0000", justify=LEFT, wraplength=480,
                   font=("Arial", 8),
                   text="The model may only touch files inside the workspace. "
@@ -711,11 +763,13 @@ class oChatGUI:
             try:
                 cmd_to = int(command_timeout_var.get().strip() or DEFAULT_COMMAND_TIMEOUT)
                 api_to = int(api_timeout_var.get().strip() or DEFAULT_API_TIMEOUT)
+                ctx_to = int(context_var.get().strip() or DEFAULT_CONTEXT_CHARS)
             except ValueError:
-                messagebox.showerror("Invalid timeout", "Timeouts must be whole numbers of seconds.")
+                messagebox.showerror("Invalid value", "Timeouts and the context budget must be whole numbers.")
                 return
             cmd_to = max(5, min(cmd_to, 3600))
             api_to = max(5, min(api_to, 3600))
+            ctx_to = max(20000, min(ctx_to, 1000000))
             if pol != "off":
                 if not os.path.isdir(ws):
                     messagebox.showerror("Invalid workspace",
@@ -724,7 +778,8 @@ class oChatGUI:
                     return
                 ws = os.path.realpath(ws)
             self.agent_config.update({"workspace": ws, "policy": pol,
-                                      "command_timeout": cmd_to, "api_timeout": api_to})
+                                      "command_timeout": cmd_to, "api_timeout": api_to,
+                                      "max_context_chars": ctx_to})
             if not _save_config(self.agent_config):
                 messagebox.showwarning("Warning",
                                        "Could not write config.json — settings will not survive a restart.")
@@ -832,6 +887,14 @@ class oChatGUI:
                     content = f.read()
             except OSError as e:
                 return f"Error reading {pth}: {e}"
+            if len(content) > TOOL_OUTPUT_LIMIT:
+                # Keep the head AND tail so big legacy files can't blow the context
+                # window; the model still learns the total size.
+                half = TOOL_OUTPUT_LIMIT // 2
+                content = (content[:half]
+                           + f"\n…[file truncated: {len(content)} chars total; "
+                           f"showing first {half} and last {half}]…\n"
+                           + content[-half:])
             return content if content else "(empty file)"
 
         if name == "write_file":
@@ -1222,6 +1285,7 @@ class oChatGUI:
         
         try:
             api_timeout = int(self.agent_config.get("api_timeout", DEFAULT_API_TIMEOUT))
+            budget_chars = int(self.agent_config.get("max_context_chars", DEFAULT_CONTEXT_CHARS))
             tool_round = 0
             tools_dropped = False
             agent_rounds = 0
@@ -1265,6 +1329,11 @@ class oChatGUI:
 
                     self._schedule(_show)
 
+                # Keep the exchange inside the model's context window: trim the
+                # oldest full turns once the budget is exceeded.
+                trimmed = _trim_messages(messages, budget_chars)
+                if trimmed is not messages:
+                    messages[:] = trimmed
                 try:
                     r = requests.post(f"{OLLAMA_HOST}/api/chat", json=payload,
                                       stream=True, timeout=(10, api_timeout))
@@ -1388,7 +1457,12 @@ class oChatGUI:
                         self._schedule(lambda: self.update_status("⏳ Retrying without tools…"))
                         continue
 
-                    if tool_round:
+                    if tools_dropped:
+                        msg = ("❌ The model returned nothing twice in a row. "
+                               "With a long session this is usually context "
+                               "overflow — try Session → New Session, or lower "
+                               "the agent's context budget.")
+                    elif tool_round:
                         msg = "❌ Agent stopped without a final text answer."
                     elif tools:
                         capable = self._tools_capable_models()

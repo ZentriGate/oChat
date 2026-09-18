@@ -85,6 +85,10 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
 - The agent works **autonomously**: oChat keeps prompting it with *Continue*
   between steps until it calls `task_complete(summary)` (or a 30-round safety
   cap is hit), so a single analysis step no longer ends the task.
+- **Context management:** huge file reads are truncated to a head+tail excerpt,
+  and a configurable *Context budget* (default 80 000 chars ≈ 20–24k tokens)
+  trims the oldest turns from each request so the model's window never fills
+  up mid-refactor.
 
 > ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
 > commands in the workspace. Only enable it in a directory you trust.
