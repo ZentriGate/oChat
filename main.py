@@ -559,6 +559,8 @@ class oChatGUI:
         self.chat_text.configure(state='normal')
         self.chat_text.delete('1.0', END)
         for msg in self.conversation:
+            if msg.get("role") in ("tool", None):  # tool results aren't transcript text
+                continue
             sender = {"user": "You", "assistant": "oChat"}.get(
                 msg.get("role"), msg.get("role") or "?")
             self.append_chat(sender, msg.get("content", ""))
@@ -1091,9 +1093,10 @@ class oChatGUI:
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
         for msg in self.conversation:
-            # Skip images in messages (they're handled separately)
+            # Skip images (handled separately); keep assistant tool-call narration
+            # and tool results so follow-up turns have full context.
             clean_msg = {k: v for k, v in msg.items() if k != "images"}
-            if clean_msg.get("role") in ["user", "assistant"]:
+            if clean_msg.get("role") in ["user", "assistant", "tool"]:
                 messages.append(clean_msg)
         
         # Build payload
@@ -1128,6 +1131,7 @@ class oChatGUI:
         try:
             api_timeout = int(self.agent_config.get("api_timeout", DEFAULT_API_TIMEOUT))
             tool_round = 0
+            tools_dropped = False
 
             while True:
                 self._schedule(lambda: self.update_status(f"⏳ Sending to {model}..."))
@@ -1180,6 +1184,7 @@ class oChatGUI:
 
                 # Consume the NDJSON stream: {"message": {"content": "..."}, "done": bool}
                 final_message = {}
+                streamed_tool_calls = None  # some servers send tool_calls pre-done
                 try:
                     with r:
                         for raw in r.iter_lines(decode_unicode=True):
@@ -1189,10 +1194,14 @@ class oChatGUI:
                                 obj = json.loads(raw)
                             except json.JSONDecodeError:
                                 continue
-                            piece = (obj.get("message") or {}).get("content", "")
+                            message = obj.get("message") or {}
+                            piece = message.get("content", "")
                             stream_chunk(piece or "")
+                            tc = message.get("tool_calls")
+                            if tc:
+                                streamed_tool_calls = tc
                             if obj.get("done"):
-                                final_message = obj.get("message") or {}
+                                final_message = message
                                 break
                 except requests.exceptions.Timeout:
                     # Mid-stream silence: partial output is already on screen; do not
@@ -1207,7 +1216,9 @@ class oChatGUI:
                     return
 
                 assistant_msg = "".join(chunk_parts)
-                tool_calls = final_message.get("tool_calls") or []
+                # Prefer tool calls seen on ANY stream line (some servers only send
+                # them before the final done:true message).
+                tool_calls = (final_message.get("tool_calls") or streamed_tool_calls or [])
 
                 # Agent mode: the model asked to use tools — execute and loop
                 if tool_calls and tool_round < MAX_TOOL_ITERATIONS:
@@ -1216,6 +1227,9 @@ class oChatGUI:
                         self._schedule(lambda: self._stream_tail())
                     messages.append({"role": "assistant", "content": assistant_msg,
                                      "tool_calls": tool_calls})
+                    # Persist the round so a follow-up user message keeps full context
+                    self.conversation.append({"role": "assistant", "content": assistant_msg,
+                                              "tool_calls": tool_calls})
                     for tc in tool_calls:
                         fn = tc.get("function", {}) if isinstance(tc, dict) else {}
                         name = fn.get("name", "")
@@ -1234,10 +1248,28 @@ class oChatGUI:
                         result = self._execute_tool(name, args)
                         self._schedule(lambda r_=result: self.append_chat(
                             "Tool result", f"{r_[:1200]}"))
+                        # Persist a bounded copy so sessions stay small
+                        limited = result[:TOOL_OUTPUT_LIMIT]
+                        if len(result) > TOOL_OUTPUT_LIMIT:
+                            limited += "\n...[result truncated]"
+                        self.conversation.append({"role": "tool", "content": limited})
                         messages.append({"role": "tool", "content": result})
                     continue
 
                 if not assistant_msg:
+                    # Dead-end guard: with tools declared, the model produced neither
+                    # a tool call nor any text — retry once WITHOUT tools so the
+                    # conversation doesn't stall on an empty reply.
+                    if tools and not tools_dropped:
+                        tools_dropped = True
+                        payload.pop("tools", None)
+                        payload.pop("tool_choice", None)
+                        self._schedule(lambda: self.append_chat(
+                            "System", "⚠️ Model returned no tool call and no text — "
+                            "retrying without tool calling."))
+                        self._schedule(lambda: self.update_status("⏳ Retrying without tools…"))
+                        continue
+
                     if tool_round:
                         msg = "❌ Agent stopped without a final text answer."
                     elif tools:
