@@ -110,6 +110,11 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
   `/api/show` (cached), and both `num_ctx` and the history budget are clamped to
   it — so oChat never sends more history than the model can hold. Stall stops
   remind you that progress is already saved ("send 'continue' to resume").
+- **Safe model switches & resumes:** sending "continue" (or switching models
+  mid-conversation) injects an **orientation recap** (session task, workspace,
+  policy, previous/current model) so the model can't wander into other projects
+  it only saw in old history; the switch prompt also offers starting a fresh
+  session instead.
 
 > ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
 > commands in the workspace. Only enable it in a directory you trust.

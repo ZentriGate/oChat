@@ -235,6 +235,9 @@ class oChatGUI:
         self.session_created_at = ""
         self.system_prompt = DEFAULT_SYSTEM_PROMPT
 
+        self.last_model = None  # model used for the most recent message in this session
+        self._pending_orientation = None  # set by on_send, consumed by send_and_receive
+
         # Agent (tool-calling) settings — operator-configurable, persisted in config.json
         self.agent_config = _load_config()
         # Migrate pre-split configs: the old "timeout" becomes the command timeout
@@ -458,8 +461,13 @@ class oChatGUI:
         """Refresh the list of available models"""
         self.update_status("Refreshing models...")
         models = self.get_models()
+        # Snapshot the selection FIRST: assigning values to a readonly ttk.Combobox
+        # silently resets its textvariable to the first item.
+        chosen = self.model_var.get()
         self.model_combo['values'] = models
-        if self.model_var.get() not in models and models:
+        if chosen in models:
+            self.model_var.set(chosen)  # keep the user's chosen model
+        elif models:
             self.model_var.set(models[0])
         self.update_status(f"Loaded {len(models)} model(s)")
 
@@ -1222,6 +1230,35 @@ class oChatGUI:
             self.update_status("⚠️ Ollama not running")
             return
         
+        # Detect a mid-conversation model switch: a new model shares no context with
+        # the previous one, so an orientation recap (or a fresh session) is prudent.
+        current_model = self.model_var.get()
+        model_switched = bool(self.conversation) and self.last_model and current_model != self.last_model
+        if model_switched:
+            if not messagebox.askyesno(
+                    "Model switched",
+                    f"This conversation used '{self.last_model}' but you're now "
+                    f"sending with '{current_model}'. The new model has no shared "
+                    "context and may follow a different project in the history.\n\n"
+                    "• Yes — inject an orientation recap and continue here.\n"
+                    "• No — start a New Session instead (recommended)."):
+                self.new_session(save_current=True)
+                self.update_status("✨ New session started — resend your task")
+                return
+        # A bare 'continue' is our documented recovery verb: re-anchor the (possibly
+        # new) model to this session's actual task before it sees the history.
+        if user_input.strip().lower() in {"continue", "continue.", "please continue",
+                                          "resume", "go on"} or model_switched:
+            self._pending_orientation = (
+                f"[Orientation] Task in this session: "
+                f"{self.session_title or 'untitled'}.\n"
+                f"Agent workspace: "
+                f"{self.agent_config.get('workspace', '') or '(plain chat — no workspace)'} — "
+                f"policy: {POLICY_LABELS.get(self.agent_config.get('policy', 'off'), 'off')}\n"
+                f"Previous model: {self.last_model}; current model: {current_model}.\n"
+                "Continue the EXACT task described above — do not switch to other "
+                "projects or instructions found in the history.")
+
         # Build user message with image info if present
         user_message = user_input if user_input else "[Image analysis]"
         if self.current_image_path and user_input:
@@ -1260,6 +1297,7 @@ class oChatGUI:
         self.input_text.config(state='disabled')
         # Snapshot Tk state on the main thread, then hand the request to a worker
         model = self.model_var.get()
+        self.last_model = model
         threading.Thread(target=self.send_and_receive, args=(model,), daemon=True).start()
 
     def append_chat(self, sender, message):
@@ -1315,6 +1353,9 @@ class oChatGUI:
                 "permission between steps — keep using tools until the entire "
                 "task is finished. Only when everything is done, call "
                 "task_complete(summary) with a concise report of what changed.")
+        if self._pending_orientation:
+            system_parts.append(self._pending_orientation)
+            self._pending_orientation = None  # orientation applies to round 1 only
         if system_parts:
             messages.append({"role": "system", "content": "\n\n".join(system_parts)})
         for msg in self.conversation:
@@ -1583,7 +1624,8 @@ class oChatGUI:
                     if tools_dropped:
                         resume_hint = (" Your progress is saved (files are on disk "
                                        "and the session is autosaved) — send "
-                                       "'continue' to resume.") if tool_round else ""
+                                       "'continue' to resume. If you changed "
+                                       "models, start a New Session instead.") if tool_round else ""
                         if self._probe_engine(model):
                             msg = ("❌ The model repeatedly returned nothing (after recovery nudges), yet a "
                                    "probe ping succeeded — the engine is healthy, "
@@ -1631,7 +1673,8 @@ class oChatGUI:
                     if narration_streak >= MAX_STALLED_NARRATIONS:
                         resume_hint = (" Your progress is saved (files are on disk "
                                        "and the session is autosaved) — send "
-                                       "'continue' to resume.") if tool_round else ""
+                                       "'continue' to resume. If you changed "
+                                       "models, start a New Session instead.") if tool_round else ""
                         self._schedule(lambda n=narration_streak, h=resume_hint: self.append_chat(
                             "Error", f"⏹ The model responded {n} times in a row "
                             "without calling any tool — it appears stuck in "
@@ -1643,7 +1686,8 @@ class oChatGUI:
                     if agent_rounds >= MAX_AGENT_ROUNDS:
                         resume_hint = (" Your progress is saved (files are on disk "
                                        "and the session is autosaved) — send "
-                                       "'continue' to resume.") if tool_round else ""
+                                       "'continue' to resume. If you changed "
+                                       "models, start a New Session instead.") if tool_round else ""
                         self._schedule(lambda h=resume_hint: self.append_chat(
                             "Error", f"⏹ Reached the {MAX_AGENT_ROUNDS}-round agent "
                             "limit without task_complete — stopping. Send anything "
