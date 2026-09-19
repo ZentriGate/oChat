@@ -219,8 +219,39 @@ def _trim_messages(messages, budget_chars):
                     "content": "[Earlier conversation was trimmed to fit the "
                                "model's context window — continue from the "
                                "remaining history.]"})
+    # The ORIGINAL TASK (the very first user message) must always survive, even
+    # under repeated budget halving — otherwise the model loses its instructions
+    # and starts wandering (the "gone crazy" spiral).
+    first_user = next((i for i, m in enumerate(messages)
+                       if m.get("role") == "user"), None)
+    if first_user is not None and keep_start > first_user:
+        trimmed.insert(1, {"role": "system",
+                           "content": "[Your ORIGINAL TASK]\n"
+                                      + str(messages[first_user].get("content", ""))[:800]})
     trimmed.extend(messages[keep_start:])
     return trimmed
+
+
+def _extract_xml_tool_calls(text):
+    """Extract Claude-style XML tool calls from a text reply.
+
+    Returns a list of (name, args-dict) for every <function=NAME>...</function>
+    block (with <parameter=KEY>value</parameter> children). Coder models sometimes
+    switch to this serialization instead of JSON tool_calls.
+    """
+    calls = []
+    for m in re.finditer(r"<function=([\w.-]+)>", text):
+        name = m.group(1)
+        body = text[m.end():]
+        end = body.find("</function>")
+        if end == -1:
+            end = len(body)
+        body = body[:end]
+        args = {}
+        for pm in re.finditer(r"<parameter=([\w.-]+)>([\s\S]*?)</parameter>", body):
+            args[pm.group(1)] = pm.group(2).strip()
+        calls.append((name, args))
+    return calls
 
 
 class oChatGUI:
@@ -1722,6 +1753,41 @@ class oChatGUI:
                     self._schedule(self._save_session)
                     self._schedule(lambda: self.update_status("✅ Done"))
                     return
+
+                # Coder models sometimes switch to Claude-style XML tool calls
+                # (<function=...><parameter=...>) instead of JSON tool_calls —
+                # treat them as real tools and execute them.
+                if tools:
+                    _xml_calls = _extract_xml_tool_calls(assistant_msg)
+                    if _xml_calls:
+                        agent_rounds += 1
+                        narration_streak = 0  # real tool activity resets the stall counter
+                        if seen_any[0]:
+                            self._schedule(lambda: self._stream_tail())
+                        messages.append({"role": "assistant", "content": assistant_msg})
+                        self.conversation.append({"role": "assistant", "content": assistant_msg})
+                        for cname, cargs in _xml_calls:
+                            self._schedule(lambda n=cname, a=cargs: self.append_chat(
+                                "Tool", f"🔧 {n}({self._fmt_tool_args(a)})"))
+                            result = self._execute_tool(cname, cargs)
+                            self._schedule(lambda r_=result: self.append_chat(
+                                "Tool result", f"{r_[:1200]}"))
+                            limited = result[:TOOL_OUTPUT_LIMIT]
+                            if len(result) > TOOL_OUTPUT_LIMIT:
+                                limited += "\n...[result truncated]"
+                            self.conversation.append({"role": "tool", "content": limited})
+                            messages.append({"role": "tool", "content": result})
+                        if agent_rounds >= MAX_AGENT_ROUNDS and not finished:
+                            if try_auto_resume():
+                                continue
+                            self._schedule(lambda: self.append_chat(
+                                "Error", f"⏹ Reached the {MAX_AGENT_ROUNDS}-round agent "
+                                "limit — stopping. Send anything to let the agent "
+                                "continue."))
+                            self._schedule(lambda: self.update_status("⏹ Round limit"))
+                            return
+                        continue
+
                 # Narration is EPHEMERAL: shown live and used for this round, but never
                 # persisted — so a hallucinated side-task can't poison future requests.
                 if seen_any[0]:

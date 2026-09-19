@@ -125,6 +125,13 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
   but **never persisted** — so a confabulated side-task (e.g. a model suddenly
   "remembering" a Flask book-manager) can't pollute the session history, and
   every agent request is re-anchored to the session's real task.
+- **Task can never be trimmed away:** context trimming always keeps your
+  original task message (prepended as *[Your ORIGINAL TASK]* if ever cut), so
+  repeated auto-resumes can't make the model "forget" what it is doing.
+- **Format-resilient tool calls:** coder models occasionally emit Claude-style
+  XML tool calls (`<function=list_dir><parameter=path>…</parameter></function>`)
+  instead of JSON — oChat parses and executes those exactly like regular
+  tool calls, so a format drift can no longer break the agent loop.
 
 > ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
 > commands in the workspace. Only enable it in a directory you trust.
