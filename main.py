@@ -249,6 +249,7 @@ class oChatGUI:
 
         # Ollama-reported model capabilities (name -> set of capability strings)
         self._model_caps = {}
+        self._model_ctx_cache = {}  # model name -> real context length (tokens) or None
 
         # Menu bar: File (export) and Session (history / system prompt)
         menubar = Menu(root)
@@ -465,6 +466,30 @@ class oChatGUI:
     def _tools_capable_models(self):
         """Names of installed models that Ollama reports as tool-capable (best effort)."""
         return sorted(name for name, cap_set in self._model_caps.items() if "tools" in cap_set)
+
+    def _model_context_tokens(self, model):
+        """Real context window (tokens) reported by /api/show, cached per model.
+
+        Returns None when it can't be determined (the operator's context budget
+        prevails in that case).
+        """
+        if model in self._model_ctx_cache:
+            return self._model_ctx_cache[model]
+        ctx = None
+        try:
+            r = requests.post(f"{OLLAMA_HOST}/api/show", json={"model": model}, timeout=5)
+            if r.status_code == 200:
+                info = (r.json() or {}).get("model_info") or {}
+                for key in ("llama.context_length", "model.context_length",
+                            "context_length", "llama3.context_length"):
+                    val = info.get(key)
+                    if isinstance(val, (int, float)) and val > 0:
+                        ctx = int(val)
+                        break
+        except Exception:
+            ctx = None
+        self._model_ctx_cache[model] = ctx
+        return ctx
 
     def attach_image(self):
         """Open file dialog to select an image"""
@@ -1271,6 +1296,11 @@ class oChatGUI:
         tools = _tools_for_policy(self.agent_config.get("policy", "off"))
         budget_chars = int(self.agent_config.get("max_context_chars", DEFAULT_CONTEXT_CHARS))
         history_budget = budget_chars * 3 // 4  # leave headroom for thinking + output
+        # Respect the model's REAL context window (from /api/show, cached): never
+        # send more history than it can physically hold. ~3 chars per token.
+        model_ctx = self._model_context_tokens(model)
+        if model_ctx:
+            history_budget = min(history_budget, int(model_ctx * 2.25))
 
         # Prepare messages for Ollama API (system prompt first, then chat history)
         messages = []
@@ -1304,7 +1334,9 @@ class oChatGUI:
                 "top_p": 0.9,
                 # Keep the served window at least as large as the history we send,
                 # so Ollama never silently mid-truncates the conversation.
-                "num_ctx": min(65536, max(4096, budget_chars // 3))
+                "num_ctx": (min(65536, max(4096, budget_chars // 3))
+                            if not model_ctx else
+                            max(2048, min(model_ctx, max(4096, budget_chars // 3))))
             }
         }
         
@@ -1549,17 +1581,20 @@ class oChatGUI:
                         continue
 
                     if tools_dropped:
+                        resume_hint = (" Your progress is saved (files are on disk "
+                                       "and the session is autosaved) — send "
+                                       "'continue' to resume.") if tool_round else ""
                         if self._probe_engine(model):
                             msg = ("❌ The model repeatedly returned nothing (after recovery nudges), yet a "
                                    "probe ping succeeded — the engine is healthy, "
                                    "so the model itself may be refusing or out of "
                                    "room. Try a different model or lower the "
-                                   "context budget.")
+                                   f"context budget.{resume_hint}")
                         else:
                             msg = ("❌ The model repeatedly returned nothing (after recovery nudges) AND a probe "
                                    "ping failed — the Ollama engine looks stalled. "
                                    "Check `ollama ps` and the server logs, then try "
-                                   "again.")
+                                   f"again.{resume_hint}")
                     elif tool_round:
                         msg = "❌ Agent stopped without a final text answer."
                     elif tools:
@@ -1594,19 +1629,25 @@ class oChatGUI:
                     agent_rounds += 1
                     narration_streak += 1
                     if narration_streak >= MAX_STALLED_NARRATIONS:
-                        self._schedule(lambda n=narration_streak: self.append_chat(
+                        resume_hint = (" Your progress is saved (files are on disk "
+                                       "and the session is autosaved) — send "
+                                       "'continue' to resume.") if tool_round else ""
+                        self._schedule(lambda n=narration_streak, h=resume_hint: self.append_chat(
                             "Error", f"⏹ The model responded {n} times in a row "
                             "without calling any tool — it appears stuck in "
                             "narration. Try Session → New Session, a lower "
                             "Context budget, or a larger model, then resend the "
-                            "task."))
+                            f"task.{h}"))
                         self._schedule(lambda: self.update_status("⏹ Stuck in narration"))
                         return
                     if agent_rounds >= MAX_AGENT_ROUNDS:
-                        self._schedule(lambda: self.append_chat(
+                        resume_hint = (" Your progress is saved (files are on disk "
+                                       "and the session is autosaved) — send "
+                                       "'continue' to resume.") if tool_round else ""
+                        self._schedule(lambda h=resume_hint: self.append_chat(
                             "Error", f"⏹ Reached the {MAX_AGENT_ROUNDS}-round agent "
                             "limit without task_complete — stopping. Send anything "
-                            "to let the agent continue."))
+                            f"to let the agent continue.{h}"))
                         self._schedule(lambda: self.update_status("⏹ Round limit"))
                         return
                     self._schedule(self._save_session)  # durable progress

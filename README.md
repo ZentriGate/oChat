@@ -106,6 +106,10 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
   using tools).
 - **Resilience:** transient connection drops when Ollama restarts or OOMs are
   retried up to 2× with backoff before showing *"Cannot connect"*.
+- **Model-aware windows:** the model's real context length is read once from
+  `/api/show` (cached), and both `num_ctx` and the history budget are clamped to
+  it — so oChat never sends more history than the model can hold. Stall stops
+  remind you that progress is already saved ("send 'continue' to resume").
 
 > ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
 > commands in the workspace. Only enable it in a directory you trust.
