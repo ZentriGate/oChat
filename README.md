@@ -114,7 +114,13 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
   mid-conversation) injects an **orientation recap** (session task, workspace,
   policy, previous/current model) so the model can't wander into other projects
   it only saw in old history; the switch prompt also offers starting a fresh
-  session instead.
+  session instead. Continue-matching is accent-insensitive ("ĉontinue" works).
+- **Self-driving agent loop:** stalls no longer wait for you — oChat
+  **auto-resumes up to 6 times per session** (halving the context budget each
+  time and logging `🔄 Auto-resuming (n/6)`), so a long task keeps running like
+  Cline until the model finishes. The agent is told it ends only with
+  `task_complete(summary)` or a `TASK COMPLETE:` line — plain narration is
+  never treated as the end.
 
 > ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
 > commands in the workspace. Only enable it in a directory you trust.

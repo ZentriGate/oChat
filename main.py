@@ -4,9 +4,11 @@ import requests
 import base64
 import os
 import json
+import re
 import shutil
 import subprocess
 import time
+import unicodedata
 from datetime import datetime
 from tkinter import (Tk, Text, Button, Entry, END, LEFT, RIGHT, BOTH, X, Frame,
                      ttk, Scrollbar, VERTICAL, Y, StringVar, BooleanVar, filedialog,
@@ -40,6 +42,7 @@ MAX_TOOL_ITERATIONS = 12        # cap on tool-call rounds per request
 MAX_AGENT_ROUNDS = 30           # total tool + narration rounds per agent request
 MAX_EMPTY_RECOVERIES = 2        # targeted 'continue' nudges before dropping tools
 MAX_STALLED_NARRATIONS = 3      # abort when the model narrates without any tool call
+MAX_SESSION_AUTO_RESUMES = 6    # automatic 'continue' retries per session (Cline-style)
 TOOL_OUTPUT_LIMIT = 12000       # chars of a tool result returned to the model
 
 POLICY_LABELS = {
@@ -237,6 +240,7 @@ class oChatGUI:
 
         self.last_model = None  # model used for the most recent message in this session
         self._pending_orientation = None  # set by on_send, consumed by send_and_receive
+        self._auto_resumes_used = 0  # session budget of automatic agent resumptions
 
         # Agent (tool-calling) settings — operator-configurable, persisted in config.json
         self.agent_config = _load_config()
@@ -687,6 +691,7 @@ class oChatGUI:
         """Start a fresh conversation (optionally autosaving the active one)."""
         if save_current:
             self._save_session()
+        self._auto_resumes_used = 0  # fresh auto-resume budget
         self.session_id = None
         self.session_title = "New Chat"
         self.session_created_at = ""
@@ -1247,8 +1252,11 @@ class oChatGUI:
                 return
         # A bare 'continue' is our documented recovery verb: re-anchor the (possibly
         # new) model to this session's actual task before it sees the history.
-        if user_input.strip().lower() in {"continue", "continue.", "please continue",
-                                          "resume", "go on"} or model_switched:
+        # Matching is accent-insensitive ("ĉontinue" == "continue") and skips filler
+        # words ("pls continue", "keep going", "go on").
+        _norm = unicodedata.normalize("NFKD", user_input)
+        _norm = "".join(c for c in _norm if not unicodedata.combining(c)).lower()
+        if re.search(r"\bcontinue\w*\b|\bresume\b|\bkeep going\b|\bgo on\b", _norm) or model_switched:
             self._pending_orientation = (
                 f"[Orientation] Task in this session: "
                 f"{self.session_title or 'untitled'}.\n"
@@ -1352,7 +1360,13 @@ class oChatGUI:
                 "Never stop after a single analysis step and never ask for "
                 "permission between steps — keep using tools until the entire "
                 "task is finished. Only when everything is done, call "
-                "task_complete(summary) with a concise report of what changed.")
+                "task_complete(summary) with a concise report of what changed."
+                f"\n\nThe current task in this session is: "
+                f"{self.session_title or '<untitled>'}.\n"
+                "Work ONLY on that task.\n"
+                "Plain narration is never the end — if you have no more tool "
+                "calls to make, either call task_complete(summary) or start your "
+                "final reply with the line 'TASK COMPLETE:'.")
         if self._pending_orientation:
             system_parts.append(self._pending_orientation)
             self._pending_orientation = None  # orientation applies to round 1 only
@@ -1412,6 +1426,37 @@ class oChatGUI:
             finished = False
             finish_summary = ""
             stream_cuts = 0
+
+            def try_auto_resume():
+                """Cline-style: keep the request alive with bounded automatic resumes.
+
+                Returns True when the loop should continue with fresh counters and a
+                tighter context; False once the per-session budget is exhausted.
+                """
+                nonlocal current_budget, tool_round, tools_dropped, agent_rounds, \
+                    narration_streak, recovery_nudges, stream_cuts
+                if self._auto_resumes_used >= MAX_SESSION_AUTO_RESUMES:
+                    return False
+                self._auto_resumes_used += 1
+                n = self._auto_resumes_used
+                current_budget = max(2000, current_budget // 2)
+                messages.append({"role": "user",
+                                 "content": "Continue. Keep working until the ENTIRE "
+                                 "task is complete. If it is finished, call "
+                                 "task_complete(summary) or start your reply with "
+                                 "'TASK COMPLETE:'."})
+                tool_round = 0
+                tools_dropped = False
+                agent_rounds = 0
+                narration_streak = 0
+                recovery_nudges = 0
+                stream_cuts = 0
+                self._schedule(lambda a=n: self.append_chat(
+                    "System", f"🔄 Auto-resuming ({a}/{MAX_SESSION_AUTO_RESUMES}) — "
+                    "tightening context and continuing."))
+                self._schedule(lambda: self.update_status(
+                    f"🔄 Auto-resume {self._auto_resumes_used}/{MAX_SESSION_AUTO_RESUMES}"))
+                return True
 
             while True:
                 if finished:
@@ -1584,6 +1629,8 @@ class oChatGUI:
                         self.conversation.append({"role": "tool", "content": limited})
                         messages.append({"role": "tool", "content": result})
                     if agent_rounds >= MAX_AGENT_ROUNDS and not finished:
+                        if try_auto_resume():
+                            continue
                         self._schedule(lambda: self.append_chat(
                             "Error", f"⏹ Reached the {MAX_AGENT_ROUNDS}-round agent "
                             "limit without task_complete — stopping. Send anything "
@@ -1622,6 +1669,8 @@ class oChatGUI:
                         continue
 
                     if tools_dropped:
+                        if try_auto_resume():
+                            continue
                         resume_hint = (" Your progress is saved (files are on disk "
                                        "and the session is autosaved) — send "
                                        "'continue' to resume. If you changed "
@@ -1659,6 +1708,16 @@ class oChatGUI:
                     return
 
                 # The model produced TEXT without a tool call.
+                if assistant_msg.lstrip().startswith("TASK COMPLETE"):
+                    # Explicit completion marker: this IS the final answer.
+                    self.conversation.append({"role": "assistant", "content": assistant_msg})
+                    if seen_any[0]:
+                        self._schedule(lambda: self._stream_tail())
+                    else:
+                        self._schedule(lambda a=assistant_msg: self.append_chat("oChat", a))
+                    self._schedule(self._save_session)
+                    self._schedule(lambda: self.update_status("✅ Done"))
+                    return
                 self.conversation.append({"role": "assistant", "content": assistant_msg})
                 if seen_any[0]:
                     self._schedule(lambda: self._stream_tail())
@@ -1671,6 +1730,8 @@ class oChatGUI:
                     agent_rounds += 1
                     narration_streak += 1
                     if narration_streak >= MAX_STALLED_NARRATIONS:
+                        if try_auto_resume():
+                            continue
                         resume_hint = (" Your progress is saved (files are on disk "
                                        "and the session is autosaved) — send "
                                        "'continue' to resume. If you changed "
@@ -1684,6 +1745,8 @@ class oChatGUI:
                         self._schedule(lambda: self.update_status("⏹ Stuck in narration"))
                         return
                     if agent_rounds >= MAX_AGENT_ROUNDS:
+                        if try_auto_resume():
+                            continue
                         resume_hint = (" Your progress is saved (files are on disk "
                                        "and the session is autosaved) — send "
                                        "'continue' to resume. If you changed "
