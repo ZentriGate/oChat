@@ -1264,8 +1264,10 @@ class oChatGUI:
                 f"{self.agent_config.get('workspace', '') or '(plain chat — no workspace)'} — "
                 f"policy: {POLICY_LABELS.get(self.agent_config.get('policy', 'off'), 'off')}\n"
                 f"Previous model: {self.last_model}; current model: {current_model}.\n"
-                "Continue the EXACT task described above — do not switch to other "
-                "projects or instructions found in the history.")
+                "Ignore any project or task described elsewhere in this history — "
+                "the ONLY task is the one stated above. Continue the EXACT task "
+                "described above; do not switch to other projects or instructions "
+                "found in the history.")
 
         # Build user message with image info if present
         user_message = user_input if user_input else "[Image analysis]"
@@ -1442,9 +1444,11 @@ class oChatGUI:
                 current_budget = max(2000, current_budget // 2)
                 messages.append({"role": "user",
                                  "content": "Continue. Keep working until the ENTIRE "
-                                 "task is complete. If it is finished, call "
-                                 "task_complete(summary) or start your reply with "
-                                 "'TASK COMPLETE:'."})
+                                 "task is complete. Ignore any project or task "
+                                 "described elsewhere in this history — the ONLY "
+                                 "task is the one stated above. If it is finished, "
+                                 "call task_complete(summary) or start your reply "
+                                 "with 'TASK COMPLETE:'."})
                 tool_round = 0
                 tools_dropped = False
                 agent_rounds = 0
@@ -1718,7 +1722,8 @@ class oChatGUI:
                     self._schedule(self._save_session)
                     self._schedule(lambda: self.update_status("✅ Done"))
                     return
-                self.conversation.append({"role": "assistant", "content": assistant_msg})
+                # Narration is EPHEMERAL: shown live and used for this round, but never
+                # persisted — so a hallucinated side-task can't poison future requests.
                 if seen_any[0]:
                     self._schedule(lambda: self._stream_tail())
                 else:
@@ -1773,6 +1778,7 @@ class oChatGUI:
                     continue
 
                 # Plain chat (no tools): this text IS the final answer.
+                self.conversation.append({"role": "assistant", "content": assistant_msg})
                 self._schedule(self._save_session)  # persist history
                 self._schedule(lambda: self.update_status("✅ Done"))
                 return

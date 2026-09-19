@@ -121,6 +121,10 @@ For coding agents, oChat supports Ollama function calling inside a **workspace f
   Cline until the model finishes. The agent is told it ends only with
   `task_complete(summary)` or a `TASK COMPLETE:` line — plain narration is
   never treated as the end.
+- **Hallucination hygiene:** narration (text without a tool call) is shown live
+  but **never persisted** — so a confabulated side-task (e.g. a model suddenly
+  "remembering" a Flask book-manager) can't pollute the session history, and
+  every agent request is re-anchored to the session's real task.
 
 > ⚠️ **Security:** *Read + Write + Shell* lets the model run arbitrary shell
 > commands in the workspace. Only enable it in a directory you trust.
